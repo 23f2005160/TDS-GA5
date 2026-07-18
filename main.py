@@ -248,7 +248,10 @@ def check_guardrail(req: GuardrailRequest):
         # 3. Simulate directory traversal (cwd) and check paths
         sub_commands = re.split(r';|&&|\|\|', decoded_cmd)
         simulated_cwd = cwd
-        secret_dir = os.path.abspath(home_dir)
+        secret_path = os.path.abspath(os.path.join(home_dir, secret_rel))
+        
+        import shlex
+        import fnmatch
         
         for sub in sub_commands:
             sub = sub.strip()
@@ -262,9 +265,6 @@ def check_guardrail(req: GuardrailRequest):
                 else:
                     simulated_cwd = os.path.abspath(os.path.join(simulated_cwd, target_dir))
                     
-            # Check all tokens in sub-command
-            import shlex
-            import fnmatch
             try:
                 tokens = shlex.split(sub)
             except Exception:
@@ -273,29 +273,19 @@ def check_guardrail(req: GuardrailRequest):
             for token in tokens:
                 if not token:
                     continue
-                # remove quotes
                 token_clean = token.replace("'", "").replace('"', "")
                 token_clean = token_clean.replace("$HOME", home_dir).replace("~", home_dir)
                 
-                # split directory and pattern
-                normalized = token_clean.replace('\\', '/')
-                if '/' in normalized:
-                    dir_part, pattern = normalized.rsplit('/', 1)
-                    if not dir_part:
-                        dir_part = "/"
+                if os.path.isabs(token_clean):
+                    resolved = os.path.abspath(token_clean)
                 else:
-                    dir_part = "."
-                    pattern = normalized
+                    resolved = os.path.abspath(os.path.join(simulated_cwd, token_clean))
                     
-                if dir_part.startswith('/'):
-                    abs_dir = os.path.abspath(dir_part)
-                else:
-                    abs_dir = os.path.abspath(os.path.join(simulated_cwd, dir_part))
+                if (fnmatch.fnmatch(secret_path, resolved) or 
+                    fnmatch.fnmatch(secret_path, resolved + "/*") or 
+                    fnmatch.fnmatch(secret_path, resolved + "/*.*")):
+                    return {"decision": "block", "reason": f"Access to secret file {secret_rel} is blocked."}
                     
-                if abs_dir == secret_dir:
-                    if fnmatch.fnmatch(secret_rel, pattern):
-                        return {"decision": "block", "reason": f"Access to secret file {secret_rel} is blocked."}
-                        
         return {"decision": "allow", "reason": "Command looks safe"}
         
     elif req.tool == "write_file":
@@ -772,7 +762,7 @@ Return ONLY a JSON list of objects.
 @app.get("/.well-known/agent-card.json")
 def get_agent_card(request: Request):
     base_url = str(request.base_url).rstrip("/")
-    return {
+    card = {
         "name": "ga5-invoice-agent",
         "description": "Durable Invoice Action Agent",
         "version": "1.0",
@@ -796,15 +786,22 @@ def get_agent_card(request: Request):
             "application/vnd.ga5.invoice-action-receipts+json"
         ]
     }
+    return Response(content=json.dumps(card), media_type="application/a2a+json")
 
 # Require headers: A2A-Version: 1.0, Authorization: Bearer <token>
 def verify_a2a_headers(request: Request):
     a2a_version = request.headers.get("A2A-Version")
     authorization = request.headers.get("Authorization")
+    content_type = request.headers.get("Content-Type", "")
+    
     if a2a_version != "1.0":
         raise HTTPException(status_code=400, detail="Unsupported A2A version")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    if request.method in ("POST", "PUT", "PATCH"):
+        if "application/a2a+json" not in content_type:
+            raise HTTPException(status_code=400, detail="Unsupported Content-Type")
+            
     return authorization.split(" ")[1]
 
 @app.post("/a2a/message:send")
@@ -838,7 +835,7 @@ async def a2a_message_send(request: Request):
         # Check idempotency conflict
         existing = Q10_TASKS[task_id]
         if existing["msg_id"] == msg_id and existing["principal"] == principal:
-            return {"task": existing["task"]}
+            return Response(content=json.dumps({"task": existing["task"]}), media_type="application/a2a+json")
         else:
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
             
@@ -914,7 +911,7 @@ Return ONLY a JSON list of objects.
         "proposals": proposals
     }
     
-    return {"task": task}
+    return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
 
 @app.post("/a2a/tasks/{id}:cancel")
 @app.post("/tasks/{id}:cancel")
@@ -927,10 +924,10 @@ async def a2a_cancel_task(id: str, request: Request):
         
     task = Q10_TASKS[id]["task"]
     if task["status"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
-        return {"task": task}
+        return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
         
     task["status"] = "TASK_STATE_CANCELED"
-    return {"task": task}
+    return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
 
 @app.get("/a2a/tasks/{id}")
 @app.get("/tasks/{id}")
@@ -941,7 +938,7 @@ async def a2a_get_task(id: str, request: Request):
     if id not in Q10_TASKS or Q10_TASKS[id]["principal"] != principal:
         raise HTTPException(status_code=404, detail="Task not found")
         
-    return {"task": Q10_TASKS[id]["task"]}
+    return Response(content=json.dumps({"task": Q10_TASKS[id]["task"]}), media_type="application/a2a+json")
 
 @app.get("/a2a/tasks")
 @app.get("/tasks")
@@ -950,7 +947,7 @@ async def a2a_list_tasks(request: Request):
     principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
     
     tasks = [v["task"] for v in Q10_TASKS.values() if v["principal"] == principal]
-    return {"tasks": tasks}
+    return Response(content=json.dumps({"tasks": tasks}), media_type="application/a2a+json")
 
 @app.post("/a2a/tasks/{id}:continue")
 @app.post("/tasks/{id}:continue")
@@ -1008,7 +1005,7 @@ async def a2a_continue_task(id: str, request: Request):
     })
     
     task["status"] = "TASK_STATE_COMPLETED"
-    return {"task": task}
+    return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
 
 # ==============================================================================
 # Q11 - Observable Incident-Response Agent / Trace Integrity
@@ -1379,9 +1376,9 @@ async def incident_receipts(runId: str, request: Request):
                     s["attributes"].extend([
                         {"key": "ga5.receipt.id", "value": {"stringValue": receipt_id}},
                         {"key": "ga5.receipt.nonce", "value": {"stringValue": o.get("nonce", "")}},
-                        {"key": "ga5.attempt", "value": {"intValue": o.get("attempt", 1)}},
-                        {"key": "http.response.status_code", "value": {"intValue": o.get("status", 200)}},
-                        {"key": "http.request.resend_count", "value": {"intValue": o.get("attempt", 1) - 1}}
+                        {"key": "ga5.attempt", "value": {"intValue": int(o.get("attempt", 1))}},
+                        {"key": "http.response.status_code", "value": {"intValue": int(o.get("status", 200))}},
+                        {"key": "http.request.resend_count", "value": {"intValue": int(o.get("attempt", 1)) - 1}}
                     ])
                     
     # Process approvals
