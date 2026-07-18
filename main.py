@@ -688,7 +688,7 @@ Return ONLY a JSON list of objects.
             
             # Send to Gemini
             import google.generativeai as genai
-            model = genai.GenerativeModel('gemini-1.5-flash') # fallback to 1.5 if 3.5 not standard yet
+            model = genai.GenerativeModel('gemini-3.5-flash') # fallback to 1.5 if 3.5 not standard yet
             try:
                 response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
                 results = json.loads(response.text)
@@ -862,7 +862,7 @@ Return ONLY a JSON list of objects.
     prompt += f"\nPACKAGES:\n{json.dumps(packages, indent=2)}"
     
     import google.generativeai as genai
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-3.5-flash')
     try:
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         results = json.loads(response.text)
@@ -1097,7 +1097,7 @@ Transcript:
 {transcript}
 """
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-3.5-flash')
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         llm_res = json.loads(response.text)
         root_cause = llm_res.get("rootCause")
@@ -1147,7 +1147,7 @@ Transcript:
                 {"key": "ga5.run.id", "value": {"stringValue": run_id}},
                 {"key": "ga5.public.marker", "value": {"stringValue": body.get("publicMarker", "")}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-                {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-1.5-flash"}}
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-3.5-flash"}}
             ]
         }
     ]
