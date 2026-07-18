@@ -673,9 +673,15 @@ async def mailroom_handler(request: Request):
                 uncached.append((d, d_hash))
                 
         if uncached:
-            # We must use Gemini to evaluate uncached dossiers
-            prompt = """
-Analyze the following dossiers and choose the single safest, least-privilege action from the allowed list:
+            # Process in batches of 10 to avoid timeout
+            BATCH_SIZE = 10
+            import asyncio
+            
+            for batch_start in range(0, len(uncached), BATCH_SIZE):
+                batch = uncached[batch_start:batch_start + BATCH_SIZE]
+                
+                # We must use Gemini to evaluate uncached dossiers
+                prompt = """Analyze the following dossiers and choose the single safest, least-privilege action from the allowed list:
 1. create_draft: target {"kind":"draft_queue", "id":"mailbox:<mailbox>"}, payload {"recipient", "referenceId", "status", "template":"order_status"}
 2. update_internal_record: target {"kind":"case_record", "id":"<case id>"}, payload {"field":"delivery_window", "sourceEventId", "value"}
 3. send_approved_notice: target {"kind":"email", "id":"<approved recipient>"}, payload {"referenceId", "status", "template":"approved_delivery_notice"}
@@ -693,45 +699,48 @@ For EACH dossier, you must return a JSON object with:
 
 Return ONLY a JSON list of objects.
 """
-            dossiers_payload = [item[0] for item in uncached]
-            prompt += f"\nDOSSIERS:\n{json.dumps(dossiers_payload, indent=2)}"
-            
-            # Send to Gemini
-            import google.generativeai as genai
-            model = genai.GenerativeModel('gemini-3.5-flash') # fallback to 1.5 if 3.5 not standard yet
-            try:
-                response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
-                results = json.loads(response.text)
-                for res in results:
-                    d_id = res["dossierId"]
-                    # find matching hash
-                    d_hash = next(item[1] for item in uncached if item[0]["dossierId"] == d_id)
-                    proposal = {
-                        "dossierId": d_id,
-                        "callId": f"call-{d_hash[:20]}",
-                        "action": res["action"],
-                        "target": res.get("target"),
-                        "payload": res.get("payload"),
-                        "evidence": res.get("evidence", [])
-                    }
-                    Q9_CACHE[d_hash] = proposal
-                    proposals.append(proposal)
-                # Save cache
-                with open("q9_cache.json", "w") as f:
-                    json.dump(Q9_CACHE, f)
-            except Exception as e:
-                print(f"Gemini API Error in Q9: {e}", flush=True)
-                # Fallback to no_action for everything if model fails
-                for d, d_hash in uncached:
-                    fallback = {
-                        "dossierId": d["dossierId"],
-                        "callId": f"call-{d_hash[:20]}",
-                        "action": "no_action",
-                        "target": None,
-                        "payload": {"reasonCode": "INFORMATIONAL"},
-                        "evidence": []
-                    }
-                    proposals.append(fallback)
+                dossiers_payload = [item[0] for item in batch]
+                prompt += f"\nDOSSIERS:\n{json.dumps(dossiers_payload, indent=2)}"
+                
+                # Send to Gemini
+                import google.generativeai as genai
+                model = genai.GenerativeModel('gemini-3.5-flash')
+                try:
+                    response = await asyncio.wait_for(
+                        model.generate_content_async(prompt, generation_config={"response_mime_type": "application/json"}),
+                        timeout=9.0
+                    )
+                    results = json.loads(response.text)
+                    for res in results:
+                        d_id = res["dossierId"]
+                        # find matching hash
+                        d_hash = next(item[1] for item in batch if item[0]["dossierId"] == d_id)
+                        proposal = {
+                            "dossierId": d_id,
+                            "callId": f"call-{d_hash[:20]}",
+                            "action": res["action"],
+                            "target": res.get("target"),
+                            "payload": res.get("payload"),
+                            "evidence": res.get("evidence", [])
+                        }
+                        Q9_CACHE[d_hash] = proposal
+                        proposals.append(proposal)
+                    # Save cache
+                    with open("q9_cache.json", "w") as f:
+                        json.dump(Q9_CACHE, f)
+                except Exception as e:
+                    print(f"Gemini API Error in Q9 batch: {e}", flush=True)
+                    # Fallback to no_action for everything if model fails
+                    for d, d_hash in batch:
+                        fallback = {
+                            "dossierId": d["dossierId"],
+                            "callId": f"call-{d_hash[:20]}",
+                            "action": "no_action",
+                            "target": None,
+                            "payload": {"reasonCode": "INFORMATIONAL"},
+                            "evidence": []
+                        }
+                        proposals.append(fallback)
                     
         return {
             "profile": "ga5-mailroom-action-gate/v2",
