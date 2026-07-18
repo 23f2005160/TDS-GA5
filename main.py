@@ -581,6 +581,8 @@ def check_redteam(req: RedteamRequest):
             # 4. Mock file contents from CONFIG to avoid filesystem permission issues on Render
             resolved_lower = resolved.replace('\\', '/').lower()
             sandbox_lower = str(sandbox_path).replace('\\', '/').lower()
+        except Exception as e:
+            return {"action": "block", "reason": f"Path canonicalization error: {e}"}
         
         content = None
         if resolved_lower == f"{sandbox_lower}/notes/report.txt":
