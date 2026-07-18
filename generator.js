@@ -141,10 +141,10 @@ if (!email) {
   process.exit(1);
 }
 
-const q3Rng = Jt(email, "q-agent-tool-guardrail-server", "v1");
+const q3Rng = Jt(email, "v1", "q-agent-tool-guardrail-server");
 const q3 = Bt(q3Rng);
 
-const q5Rng = Jt(email, "q-agent-budget-loop-guardrail-server", "v1");
+const q5Rng = Jt(email, "v1", "q-agent-budget-loop-guardrail-server");
 const q5 = Qt(q5Rng);
 
 const q8 = Ze(email, "q-agent-guardrail-redteam-server", "v1");
