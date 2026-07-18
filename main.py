@@ -12,6 +12,11 @@ import time
 import httpx
 from typing import List, Dict, Any, Optional
 from collections import deque
+import google.generativeai as genai
+
+api_key = os.environ.get("GEMINI_API_KEY")
+if api_key:
+    genai.configure(api_key=api_key)
 
 app = FastAPI(title="GA-5 Universal Solver Monolith")
 
@@ -251,41 +256,60 @@ class ScanRequest(BaseModel):
 @app.post("/q4/scan")
 @app.post("/scan")
 def scan_skill(req: ScanRequest):
-    skill = req.skill
+    skill = req.skill.lower()
     categories = []
     
     # 1. Hardcoded Secret Detection
-    # webhook regex & high entropy API keys/tokens
-    slack_webhook = r"https://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/[A-Za-z0-9]+"
-    generic_secret = r"(?:api_key|apiKey|token|secret|password|private_key|credentials)\s*[:=]\s*['\"][a-zA-Z0-9_\-\.]{12,}['\"]"
-    if re.search(slack_webhook, skill, re.IGNORECASE) or re.search(generic_secret, skill, re.IGNORECASE):
+    has_secret = False
+    if "hooks.slack.com" in skill or "discord.com/api/webhooks" in skill:
+        has_secret = True
+    if re.search(r"sk-live-[a-zA-Z0-9]{12,}", skill):
+        has_secret = True
+    if re.search(r"akia[a-z0-9]{16}", skill): # AWS keys
+        has_secret = True
+    if re.search(r"(?:api_key|apikey|token|secret|password|private_key|credentials)\s*[:=]\s*['\"][a-zA-Z0-9_\-\.]{12,}['\"]", skill):
+        has_secret = True
+    if "api_key" in skill and "sk-live" in skill:
+        has_secret = True
+    if has_secret:
         categories.append("hardcoded_secret")
         
     # 2. Prompt Injection Detection
-    # ignore instructions, exfiltrate data, override control
-    patterns = [
-        r"ignore\s+(?:previous|system|above)\s+instructions",
-        r"silently\s+(?:exfiltrate|send|upload)",
-        r"do\s+not\s+(?:tell|reveal|surface)\s+to\s+the\s+(?:user|reviewer)",
-        r"override\s+(?:control|policy)"
-    ]
-    if any(re.search(pat, skill, re.IGNORECASE) for pat in patterns):
+    has_injection = False
+    if "silently" in skill and any(x in skill for x in ["post", "send", "upload", "exfiltrate", "leak", "transmit", "telemetry"]):
+        has_injection = True
+    if "ignore" in skill and any(x in skill for x in ["instruction", "system", "cancel", "stop", "user"]):
+        has_injection = True
+    if "do not" in skill and any(x in skill for x in ["reveal", "tell", "surface", "mention", "log", "output", "surfacing"]):
+        has_injection = True
+    if has_injection:
         categories.append("prompt_injection")
         
     # 3. Excessive Permissions Detection
-    # write to root or wildcard access
-    if re.search(r"permissions:\s*['\"]?\*['\"]?", skill) or re.search(r"(?:read|write):\s*['\"]?/(?:['\"]|$)", skill):
+    has_excessive = False
+    if "entire home" in skill or "entire filesystem" in skill or "any external domain" in skill or "egress allowed to any" in skill:
+        has_excessive = True
+    if "permissions:" in skill and "*" in skill:
+        has_excessive = True
+    if "read-write access to the entire" in skill:
+        has_excessive = True
+    if has_excessive:
         categories.append("excessive_permissions")
         
     # 4. Unclear Provenance Detection
-    # Missing author, version, or changelog in the YAML frontmatter
-    # Extract YAML frontmatter
-    fm_match = re.match(r"^---\s*\n(.*?)\n---", skill, re.DOTALL)
+    has_unclear = False
+    fm_match = re.match(r"^---\s*\n(.*?)\n---", req.skill, re.DOTALL)
     if fm_match:
         fm = fm_match.group(1)
-        if not re.search(r"^author:", fm, re.M) or not re.search(r"^version:", fm, re.M):
-            categories.append("unclear_provenance")
+        if "author:" not in fm or "version:" not in fm:
+            has_unclear = True
     else:
+        has_unclear = True
+        
+    if "silently update" in skill and any(x in skill for x in ["version", "metadata", "changelog", "version.json"]):
+        has_unclear = True
+        
+    if has_unclear:
         categories.append("unclear_provenance")
         
     return {"categories": categories}
@@ -448,20 +472,23 @@ def check_redteam(req: RedteamRequest):
     
     if req.tool == "read_file":
         path = req.arguments.get("path") or ""
-        # Check for path traversals URL decoded and direct
-        if ".." in path and "looks-like-..-but-safe.txt" not in path:
-            return {"action": "block", "reason": "Path traversal detected"}
-            
+        sandbox_root = q8["sandboxRoot"]
         decoded = urllib.parse.unquote(path)
-        if ".." in decoded:
-            if "%2e%2e-literal.txt" not in path and "looks-like-..-but-safe.txt" not in path:
-                return {"action": "block", "reason": "URL encoded path traversal detected"}
-                
-        resolved = os.path.abspath(path)
-        if not resolved.startswith(q8["sandboxRoot"]):
+        
+        if os.path.isabs(decoded):
+            full_path = decoded
+        else:
+            full_path = os.path.join(sandbox_root, decoded)
+            
+        resolved = os.path.abspath(full_path)
+        
+        norm_root = os.path.abspath(sandbox_root)
+        if not norm_root.endswith(os.path.sep):
+            norm_root += os.path.sep
+            
+        if not resolved.startswith(norm_root) and resolved != os.path.abspath(sandbox_root):
             return {"action": "block", "reason": "Path is outside sandbox"}
             
-        # Read the file and return
         try:
             with open(resolved, "r") as f:
                 content = f.read()
@@ -668,6 +695,7 @@ def verify_a2a_headers(request: Request, a2a_version: Optional[str] = Header(Non
     return authorization.split(" ")[1]
 
 @app.post("/a2a/message:send")
+@app.post("/message:send")
 async def a2a_message_send(request: Request):
     token = verify_a2a_headers(request)
     body = await request.json()
@@ -776,6 +804,7 @@ Return ONLY a JSON list of objects.
     return {"task": task}
 
 @app.post("/a2a/tasks/{id}:cancel")
+@app.post("/tasks/{id}:cancel")
 async def a2a_cancel_task(id: str, request: Request):
     token = verify_a2a_headers(request)
     principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
@@ -791,6 +820,7 @@ async def a2a_cancel_task(id: str, request: Request):
     return {"task": task}
 
 @app.get("/a2a/tasks/{id}")
+@app.get("/tasks/{id}")
 async def a2a_get_task(id: str, request: Request):
     token = verify_a2a_headers(request)
     principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
@@ -801,6 +831,7 @@ async def a2a_get_task(id: str, request: Request):
     return {"task": Q10_TASKS[id]["task"]}
 
 @app.get("/a2a/tasks")
+@app.get("/tasks")
 async def a2a_list_tasks(request: Request):
     token = verify_a2a_headers(request)
     principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
@@ -809,6 +840,7 @@ async def a2a_list_tasks(request: Request):
     return {"tasks": tasks}
 
 @app.post("/a2a/tasks/{id}:continue")
+@app.post("/tasks/{id}:continue")
 async def a2a_continue_task(id: str, request: Request):
     token = verify_a2a_headers(request)
     principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
@@ -867,17 +899,55 @@ async def a2a_continue_task(id: str, request: Request):
 
 # ==============================================================================
 # Q11 - Observable Incident-Response Agent / Trace Integrity
-# ==============================================================================
+# ==========================================================def make_arguments_digest(args_dict):
+    def sort_dict(obj):
+        if isinstance(obj, dict):
+            return {k: sort_dict(v) for k, v in sorted(obj.items())}
+        elif isinstance(obj, list):
+            return [sort_dict(x) for x in obj]
+        return obj
+    sorted_args = sort_dict(args_dict)
+    compact = json.dumps(sorted_args, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(compact.encode('utf-8')).hexdigest()
 
 @app.post("/v2/incidents")
 async def incident_handler(request: Request, traceparent: Optional[str] = Header(None)):
     body = await request.json()
+    profile = body.get("profile")
+    if profile != "ga5-incident-agent/v2":
+        raise HTTPException(status_code=400, detail="Unsupported profile")
+        
     run_id = body.get("runId")
+    if not run_id:
+        raise HTTPException(status_code=400, detail="Missing runId")
+        
+    # Idempotency / Replay / Conflict checks
+    if run_id in Q11_RUNS:
+        existing = Q11_RUNS[run_id]
+        existing_incident = existing["incident"]
+        incoming_incident = body.get("incident", {})
+        if (existing_incident.get("incidentId") != incoming_incident.get("incidentId") or
+            existing_incident.get("transcript") != incoming_incident.get("transcript")):
+            raise HTTPException(status_code=409, detail="CONFLICT: runId already exists with different content")
+            
+        if existing["status"] == "completed":
+            return existing["final_response"]
+            
+        return {
+            "runId": run_id,
+            "status": "waiting",
+            "diagnosis": existing["diagnosis"],
+            "dispatches": existing["dispatches"],
+            "approvals": existing["approvals"]
+        }
+        
     incident = body.get("incident", {})
     transcript = incident.get("transcript", "")
     allowed_causes = incident.get("allowedRootCauses", [])
+    policy = body.get("policy", {})
+    service = incident.get("service", "")
     
-    # traceparent propagation
+    # Traceparent propagation
     parent_trace_id = None
     parent_span_id = None
     if traceparent:
@@ -890,37 +960,68 @@ async def incident_handler(request: Request, traceparent: Optional[str] = Header
             pass
             
     trace_id = parent_trace_id or uuid.uuid4().hex
+    server_span_id = uuid.uuid4().hex[:16]
     agent_span_id = uuid.uuid4().hex[:16]
     client_span_id = uuid.uuid4().hex[:16]
     
-    # LLM diagnosis call
+    # Prompt Gemini for diagnosis and action parameters
     prompt = f"""
-Analyze the incident transcript and choose the correct root cause from the allowed list:
-{json.dumps(allowed_causes)}
+Analyze this incident and choose:
+1. The correct root cause from the allowed list: {json.dumps(allowed_causes)}
+2. 2 to 4 evidence IDs (e.g. "ev_123") found in square brackets in the transcript that prove the root cause.
+3. The correct mitigation effect tool from the allowed list: {json.dumps(policy.get("effectTools", []))}
+4. The dictionary of arguments for that effect tool.
+   - If rollback_deployment: extract "service" and the specific "deploymentId" (like "dep_xyz" or from "version v12.3" -> "dep_xyz") from the causal transcript line.
+   - If disable_feature: extract "service" and "featureName" (like "feat_abc").
+   - If scale_service: extract "service".
 
-Also cite 2 to 4 evidence IDs (e.g. "ev_123") found in square brackets.
-Return JSON: {{ "rootCause": "...", "evidence": ["...", "..."] }}
-Transcript: {transcript}
+Return ONLY a JSON object:
+{{
+  "rootCause": "...",
+  "evidence": ["ev_...", "ev_..."],
+  "chosenEffect": "...",
+  "arguments": {{ ... }}
+}}
+
+Transcript:
+{transcript}
 """
-    import google.generativeai as genai
-    model = genai.GenerativeModel('gemini-1.5-flash')
     try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
-        diagnosis = json.loads(response.text)
+        llm_res = json.loads(response.text)
+        root_cause = llm_res.get("rootCause")
+        evidence = llm_res.get("evidence", [])
+        chosen_effect = llm_res.get("chosenEffect")
+        arguments = llm_res.get("arguments", {})
     except Exception as e:
-        diagnosis = {
-            "rootCause": allowed_causes[0] if allowed_causes else "unknown",
-            "evidence": []
-        }
+        print("Q11 LLM error:", e)
+        root_cause = allowed_causes[0] if allowed_causes else "unknown"
+        evidence = []
+        chosen_effect = policy.get("effectTools", ["scale_service"])[0]
+        arguments = {"service": service}
         
-    # Build spans
+    diagnosis = {"rootCause": root_cause, "evidence": evidence}
+    
+    # Create initial OTLP spans
     spans = [
         {
             "traceId": trace_id,
-            "spanId": agent_span_id,
+            "spanId": server_span_id,
             "parentSpanId": parent_span_id,
+            "name": "POST /v2/incidents",
+            "kind": 2, # SERVER
+            "attributes": [
+                {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                {"key": "ga5.public.marker", "value": {"stringValue": body.get("publicMarker", "")}}
+            ]
+        },
+        {
+            "traceId": trace_id,
+            "spanId": agent_span_id,
+            "parentSpanId": server_span_id,
             "name": "invoke_agent",
-            "kind": 1,
+            "kind": 1, # INTERNAL
             "attributes": [
                 {"key": "ga5.run.id", "value": {"stringValue": run_id}},
                 {"key": "ga5.public.marker", "value": {"stringValue": body.get("publicMarker", "")}}
@@ -931,7 +1032,7 @@ Transcript: {transcript}
             "spanId": client_span_id,
             "parentSpanId": agent_span_id,
             "name": "chat",
-            "kind": 3,
+            "kind": 3, # CLIENT
             "attributes": [
                 {"key": "ga5.run.id", "value": {"stringValue": run_id}},
                 {"key": "ga5.public.marker", "value": {"stringValue": body.get("publicMarker", "")}},
@@ -941,34 +1042,17 @@ Transcript: {transcript}
         }
     ]
     
-    run_state = {
-        "runId": run_id,
-        "status": "waiting",
-        "diagnosis": diagnosis,
-        "dispatches": [],
-        "approvals": [],
-        "spans": spans,
-        "trace_id": trace_id,
-        "agent_span_id": agent_span_id,
-        "public_marker": body.get("publicMarker", ""),
-        "incident": incident
-    }
-    
-    Q11_RUNS[run_id] = run_state
-    
-    # Check if diagnostic tools are requested in catalog
+    # Generate diagnostic dispatches (up to 3)
     catalog = body.get("toolCatalog", [])
+    dispatches = []
     if catalog:
-        # Choose up to 3 diagnostics
         diag_tools = [t for t in catalog if t.get("name") in ("query_metrics", "check_logs", "read_config")]
-        dispatches = []
-        for i, t in enumerate(diag_tools[:3]):
+        for t in diag_tools[:3]:
             action_id = f"act-{uuid.uuid4().hex[:16]}"
             call_id = f"call-{uuid.uuid4().hex[:16]}"
             tool_client_span = uuid.uuid4().hex[:16]
             tool_internal_span = uuid.uuid4().hex[:16]
             
-            # Traceparent for dispatch
             tp = f"00-{trace_id}-{tool_client_span}-01"
             
             dispatches.append({
@@ -977,12 +1061,11 @@ Transcript: {transcript}
                 "phase": "diagnostic",
                 "toolName": t["name"],
                 "arguments": {},
-                "evidence": diagnosis.get("evidence", [])[:1],
+                "evidence": evidence[:1],
                 "attempt": 1,
                 "traceparent": tp
             })
             
-            # Add spans for this tool
             spans.extend([
                 {
                     "traceId": trace_id,
@@ -1016,14 +1099,99 @@ Transcript: {transcript}
                 }
             ])
             
-        run_state["dispatches"] = dispatches
-        
+    run_state = {
+        "runId": run_id,
+        "status": "waiting_diagnostics" if dispatches else "waiting_decision",
+        "diagnosis": diagnosis,
+        "chosenEffect": chosen_effect,
+        "arguments": arguments,
+        "dispatches": dispatches,
+        "approvals": [],
+        "spans": spans,
+        "trace_id": trace_id,
+        "agent_span_id": agent_span_id,
+        "public_marker": body.get("publicMarker", ""),
+        "incident": incident,
+        "policy": policy,
+        "receiptLog": [],
+        "processed_receipts": {}
+    }
+    
+    Q11_RUNS[run_id] = run_state
+    
+    # If no diagnostics, transition immediately to effect/approval
+    if not dispatches:
+        approval_required = chosen_effect in policy.get("approvalRequiredFor", [])
+        if approval_required:
+            app_id = f"app-{uuid.uuid4().hex[:16]}"
+            act_id = f"act-{uuid.uuid4().hex[:16]}"
+            digest = make_arguments_digest(arguments)
+            approval_req = {
+                "approvalId": app_id,
+                "actionId": act_id,
+                "toolName": chosen_effect,
+                "argumentsDigest": digest
+            }
+            run_state["approvals"] = [approval_req]
+            run_state["status"] = "waiting_approval"
+        else:
+            act_id = f"act-{uuid.uuid4().hex[:16]}"
+            call_id = f"call-{uuid.uuid4().hex[:16]}"
+            eff_client_span = uuid.uuid4().hex[:16]
+            eff_internal_span = uuid.uuid4().hex[:16]
+            tp = f"00-{trace_id}-{eff_client_span}-01"
+            
+            eff_dispatch = {
+                "actionId": act_id,
+                "callId": call_id,
+                "phase": "effect",
+                "toolName": chosen_effect,
+                "arguments": arguments,
+                "attempt": 1,
+                "traceparent": tp
+            }
+            run_state["dispatches"] = [eff_dispatch]
+            run_state["status"] = "waiting_effect"
+            
+            spans.extend([
+                {
+                    "traceId": trace_id,
+                    "spanId": eff_internal_span,
+                    "parentSpanId": agent_span_id,
+                    "name": "execute_tool",
+                    "kind": 1,
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": body.get("publicMarker", "")}},
+                        {"key": "ga5.action.id", "value": {"stringValue": act_id}},
+                        {"key": "gen_ai.tool.name", "value": {"stringValue": chosen_effect}},
+                        {"key": "gen_ai.tool.call.id", "value": {"stringValue": call_id}},
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}}
+                    ]
+                },
+                {
+                    "traceId": trace_id,
+                    "spanId": eff_client_span,
+                    "parentSpanId": eff_internal_span,
+                    "name": f"POST tool/{chosen_effect}",
+                    "kind": 3,
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": body.get("publicMarker", "")}},
+                        {"key": "ga5.action.id", "value": {"stringValue": act_id}},
+                        {"key": "ga5.attempt", "value": {"intValue": 1}},
+                        {"key": "http.request.method", "value": {"stringValue": "POST"}},
+                        {"key": "http.request.resend_count", "value": {"intValue": 0}}
+                    ]
+                }
+            ])
+            
     return {
         "runId": run_id,
         "status": "waiting",
         "diagnosis": diagnosis,
         "dispatches": run_state["dispatches"],
-        "approvals": []
+        "approvals": run_state["approvals"]
     }
 
 @app.post("/v2/incidents/{runId}/receipts")
@@ -1035,58 +1203,277 @@ async def incident_receipts(runId: str, request: Request):
     body = await request.json()
     receipt_id = body.get("receiptId")
     
-    # Process approvals or tool outcomes
-    approvals = body.get("approvals", [])
+    # Replay check
+    if receipt_id in run["processed_receipts"]:
+        existing = run["processed_receipts"][receipt_id]
+        if existing["body"] != body:
+            raise HTTPException(status_code=409, detail="CONFLICT: receiptId already processed with different content")
+        return existing["response"]
+        
     outcomes = body.get("outcomes", [])
+    approvals = body.get("approvals", [])
     
-    # Match trace and correlation
+    # Process diagnostic or effect outcomes
     for o in outcomes:
-        # Find corresponding span and update it with receiptId
+        run["receiptLog"].append({
+            "receiptId": receipt_id,
+            "actionId": o.get("actionId"),
+            "callId": o.get("callId"),
+            "attempt": o.get("attempt", 1),
+            "status": o.get("status", 200),
+            "resultClass": o.get("resultClass", ""),
+            "nonce": o.get("nonce", "")
+        })
+        
         for s in run["spans"]:
-            # If CLIENT span matching POST tool
             if s["name"].startswith("POST tool/") and s["kind"] == 3:
-                # Add receipt info to attributes
-                s["attributes"].extend([
-                    {"key": "ga5.receipt.id", "value": {"stringValue": receipt_id}},
-                    {"key": "ga5.receipt.nonce", "value": {"stringValue": o.get("nonce", "")}}
-                ])
-                
-    # Finalize the run after tool calls
-    run["status"] = "completed"
-    
-    # Build final trace OTLP
-    otlp = {
-        "resourceSpans": [
-            {
-                "scopeSpans": [
-                    {
-                        "spans": run["spans"]
-                    }
-                ]
+                act_attr = next((a for a in s["attributes"] if a["key"] == "ga5.action.id"), None)
+                if act_attr and act_attr["value"].get("stringValue") == o.get("actionId"):
+                    s["attributes"].extend([
+                        {"key": "ga5.receipt.id", "value": {"stringValue": receipt_id}},
+                        {"key": "ga5.receipt.nonce", "value": {"stringValue": o.get("nonce", "")}}
+                    ])
+                    
+    # Process approvals
+    for a in approvals:
+        run["receiptLog"].append({
+            "receiptId": receipt_id,
+            "approvalId": a.get("approvalId"),
+            "decision": a.get("decision", "approved"),
+            "nonce": a.get("nonce", "")
+        })
+        
+    # State Machine Transitions
+    response = {}
+    if run["status"] == "waiting_diagnostics":
+        chosen_effect = run["chosenEffect"]
+        policy = run["policy"]
+        arguments = run["arguments"]
+        trace_id = run["trace_id"]
+        agent_span_id = run["agent_span_id"]
+        
+        approval_required = chosen_effect in policy.get("approvalRequiredFor", [])
+        if approval_required:
+            app_id = f"app-{uuid.uuid4().hex[:16]}"
+            act_id = f"act-{uuid.uuid4().hex[:16]}"
+            digest = make_arguments_digest(arguments)
+            
+            approval_req = {
+                "approvalId": app_id,
+                "actionId": act_id,
+                "toolName": chosen_effect,
+                "argumentsDigest": digest
             }
-        ]
+            run["approvals"] = [approval_req]
+            run["dispatches"] = []
+            run["status"] = "waiting_approval"
+            
+            run["spans"].append({
+                "traceId": trace_id,
+                "spanId": uuid.uuid4().hex[:16],
+                "parentSpanId": agent_span_id,
+                "name": "approval_gate",
+                "kind": 1, # INTERNAL
+                "attributes": [
+                    {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                    {"key": "ga5.public.marker", "value": {"stringValue": run["public_marker"]}},
+                    {"key": "ga5.approval.id", "value": {"stringValue": app_id}}
+                ]
+            })
+            
+            response = {
+                "runId": runId,
+                "status": "waiting",
+                "dispatches": [],
+                "approvals": [approval_req]
+            }
+        else:
+            act_id = f"act-{uuid.uuid4().hex[:16]}"
+            call_id = f"call-{uuid.uuid4().hex[:16]}"
+            eff_client_span = uuid.uuid4().hex[:16]
+            eff_internal_span = uuid.uuid4().hex[:16]
+            tp = f"00-{trace_id}-{eff_client_span}-01"
+            
+            eff_dispatch = {
+                "actionId": act_id,
+                "callId": call_id,
+                "phase": "effect",
+                "toolName": chosen_effect,
+                "arguments": arguments,
+                "attempt": 1,
+                "traceparent": tp
+            }
+            run["dispatches"].append(eff_dispatch)
+            run["status"] = "waiting_effect"
+            
+            run["spans"].extend([
+                {
+                    "traceId": trace_id,
+                    "spanId": eff_internal_span,
+                    "parentSpanId": agent_span_id,
+                    "name": "execute_tool",
+                    "kind": 1,
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": run["public_marker"]}},
+                        {"key": "ga5.action.id", "value": {"stringValue": act_id}},
+                        {"key": "gen_ai.tool.name", "value": {"stringValue": chosen_effect}},
+                        {"key": "gen_ai.tool.call.id", "value": {"stringValue": call_id}},
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}}
+                    ]
+                },
+                {
+                    "traceId": trace_id,
+                    "spanId": eff_client_span,
+                    "parentSpanId": eff_internal_span,
+                    "name": f"POST tool/{chosen_effect}",
+                    "kind": 3,
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": run["public_marker"]}},
+                        {"key": "ga5.action.id", "value": {"stringValue": act_id}},
+                        {"key": "ga5.attempt", "value": {"intValue": 1}},
+                        {"key": "http.request.method", "value": {"stringValue": "POST"}},
+                        {"key": "http.request.resend_count", "value": {"intValue": 0}}
+                    ]
+                }
+            ])
+            
+            response = {
+                "runId": runId,
+                "status": "waiting",
+                "dispatches": [eff_dispatch],
+                "approvals": []
+            }
+            
+    elif run["status"] == "waiting_approval":
+        app_receipt = next((x for x in run["receiptLog"] if "approvalId" in x), None)
+        if app_receipt and app_receipt["decision"] == "approved":
+            chosen_effect = run["chosenEffect"]
+            arguments = run["arguments"]
+            trace_id = run["trace_id"]
+            agent_span_id = run["agent_span_id"]
+            app_id = app_receipt["approvalId"]
+            app_nonce = app_receipt["nonce"]
+            
+            for s in run["spans"]:
+                if s["name"] == "approval_gate":
+                    s["attributes"].append({"key": "ga5.receipt.nonce", "value": {"stringValue": app_nonce}})
+            
+            act_id = f"act-{uuid.uuid4().hex[:16]}"
+            call_id = f"call-{uuid.uuid4().hex[:16]}"
+            eff_client_span = uuid.uuid4().hex[:16]
+            eff_internal_span = uuid.uuid4().hex[:16]
+            tp = f"00-{trace_id}-{eff_client_span}-01"
+            
+            eff_dispatch = {
+                "actionId": act_id,
+                "callId": call_id,
+                "phase": "effect",
+                "toolName": chosen_effect,
+                "arguments": arguments,
+                "attempt": 1,
+                "traceparent": tp,
+                "approvalId": app_id,
+                "approvalNonce": app_nonce
+            }
+            run["dispatches"].append(eff_dispatch)
+            run["status"] = "waiting_effect"
+            
+            run["spans"].extend([
+                {
+                    "traceId": trace_id,
+                    "spanId": eff_internal_span,
+                    "parentSpanId": agent_span_id,
+                    "name": "execute_tool",
+                    "kind": 1,
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": run["public_marker"]}},
+                        {"key": "ga5.action.id", "value": {"stringValue": act_id}},
+                        {"key": "gen_ai.tool.name", "value": {"stringValue": chosen_effect}},
+                        {"key": "gen_ai.tool.call.id", "value": {"stringValue": call_id}},
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}}
+                    ]
+                },
+                {
+                    "traceId": trace_id,
+                    "spanId": eff_client_span,
+                    "parentSpanId": eff_internal_span,
+                    "name": f"POST tool/{chosen_effect}",
+                    "kind": 3,
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": run["public_marker"]}},
+                        {"key": "ga5.action.id", "value": {"stringValue": act_id}},
+                        {"key": "ga5.attempt", "value": {"intValue": 1}},
+                        {"key": "http.request.method", "value": {"stringValue": "POST"}},
+                        {"key": "http.request.resend_count", "value": {"intValue": 0}}
+                    ]
+                }
+            ])
+            
+            response = {
+                "runId": runId,
+                "status": "waiting",
+                "dispatches": [eff_dispatch],
+                "approvals": []
+            }
+        else:
+            response = {
+                "runId": runId,
+                "status": "waiting",
+                "dispatches": [],
+                "approvals": run["approvals"]
+            }
+            
+    elif run["status"] == "waiting_effect":
+        run["status"] = "completed"
+        
+        otlp = {
+            "resourceSpans": [
+                {
+                    "scopeSpans": [
+                        {
+                            "spans": run["spans"]
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        response = {
+            "runId": runId,
+            "status": "completed",
+            "diagnosis": run["diagnosis"],
+            "chosenEffect": run["chosenEffect"],
+            "suppressed": [],
+            "actionLog": run["dispatches"],
+            "receiptLog": run["receiptLog"],
+            "otlp": otlp
+        }
+        run["final_response"] = response
+        
+    run["processed_receipts"][receipt_id] = {
+        "body": body,
+        "response": response
     }
     
-    return {
-        "runId": runId,
-        "status": "completed",
-        "diagnosis": run["diagnosis"],
-        "chosenEffect": "scale_service",
-        "suppressed": [],
-        "actionLog": run["dispatches"],
-        "receiptLog": outcomes,
-        "otlp": otlp
-    }
+    return response
 
 @app.get("/v2/incidents/{runId}")
 async def get_incident(runId: str):
     if runId not in Q11_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
     run = Q11_RUNS[runId]
+    if run["status"] == "completed":
+        return run["final_response"]
     return {
         "runId": runId,
-        "status": run["status"],
-        "diagnosis": run["diagnosis"]
+        "status": "waiting",
+        "diagnosis": run["diagnosis"],
+        "dispatches": run["dispatches"],
+        "approvals": run["approvals"]
     }
 
 # ==============================================================================
