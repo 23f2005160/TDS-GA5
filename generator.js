@@ -1,36 +1,62 @@
 const fs = require('fs');
 
 function alea(seed) {
-  function t(e){
-    var n=this,i=l();
-    n.next=function(){var a=2091639*n.s0+n.c*23283064365386963e-26;return n.s0=n.s1,n.s1=n.s2,n.s2=a-(n.c=a|0)};
-    n.c=1;
-    n.s0=i(" ");n.s1=i(" ");n.s2=i(" ");
-    n.s0-=i(e);n.s0<0&&(n.s0+=1);
-    n.s1-=i(e);n.s1<0&&(n.s1+=1);
-    n.s2-=i(e);n.s2<0&&(n.s2+=1);
-    i=null;
+  var width = 256,
+      chunks = 6,
+      digits = 52,
+      startdenom = Math.pow(width, chunks),
+      significance = Math.pow(2, digits),
+      overflow = significance * 2,
+      mask = width - 1;
+  
+  var key = [];
+  var stringseed = seed + '', smear = 0, j = 0;
+  while (j < stringseed.length) {
+    key[mask & j] = mask & ((smear ^= (key[mask & j] || 0) * 19) + stringseed.charCodeAt(j++));
   }
-  function p(e,n){return n.c=e.c,n.s0=e.s0,n.s1=e.s1,n.s2=e.s2,n}
-  function d(e,n){
-    var i=new t(e),a=n&&n.state,r=i.next;
-    return r.int32=function(){return i.next()*4294967296|0},
-           r.double=function(){return r()+(r()*2097152|0)*11102230246251565e-32},
-           r.quick=r,
-           a&&(typeof a=="object"&&p(a,i),r.state=function(){return p(i,{})}),
-           r
-  }
-  function l(){
-    var e=4022871197,n=function(i){
-      i=String(i);
-      for(var a=0;a<i.length;a++){
-        e+=i.charCodeAt(a);var r=.02519603282416938*e;e=r>>>0,r-=e,r*=e,e=r>>>0,r-=e,e+=r*4294967296
+  
+  var arc4 = new ARC4(key);
+  
+  var prng = function() {
+    var n = arc4.g(chunks),
+        d = startdenom,
+        x = 0;
+    while (n < significance) {
+      n = (n + x) * width;
+      d *= width;
+      x = arc4.g(1);
+    }
+    while (n >= overflow) {
+      n /= 2;
+      d /= 2;
+      x >>>= 1;
+    }
+    return (n + x) / d;
+  };
+  return prng;
+  
+  function ARC4(key) {
+    var t, keylen = key.length,
+        me = this, i = 0, j = 0, s = me.S = [];
+    if (!keylen) { key = [keylen++]; }
+    while (i < width) { s[i] = i++; }
+    for (i = 0; i < width; i++) {
+      s[i] = s[j = mask & (j + key[i % keylen] + (t = s[i]))];
+      s[j] = t;
+    }
+    me.i = 0;
+    me.j = 0;
+    me.g = function(count) {
+      var t, r = 0, i = me.i, j = me.j, s = me.S;
+      while (count--) {
+        t = s[i = mask & (i + 1)];
+        r = r * width + s[mask & ((s[i] = s[j = mask & (j + t)]) + (s[j] = t))];
       }
-      return(e>>>0)*23283064365386963e-26
+      me.i = i; me.j = j;
+      return r;
     };
-    return n
+    me.g(width); // discard first 256 values
   }
-  return d(seed);
 }
 
 function St(o){return String(o||"").trim().toLowerCase()}
