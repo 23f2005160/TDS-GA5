@@ -720,6 +720,7 @@ Return ONLY a JSON list of objects.
                 with open("q9_cache.json", "w") as f:
                     json.dump(Q9_CACHE, f)
             except Exception as e:
+                print(f"Gemini API Error in Q9: {e}", flush=True)
                 # Fallback to no_action for everything if model fails
                 for d, d_hash in uncached:
                     fallback = {
@@ -872,7 +873,7 @@ Return ONLY a JSON list of objects.
     prompt += f"\nPACKAGES:\n{json.dumps(packages, indent=2)}"
     
     import google.generativeai as genai
-    model = genai.GenerativeModel('gemini-3-flash')
+    model = genai.GenerativeModel('gemini-3.5-flash')
     try:
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         results = json.loads(response.text)
@@ -886,7 +887,9 @@ Return ONLY a JSON list of objects.
                 "rationale": res.get("rationale", "Processed durably by invoice agent.")
             })
     except Exception as e:
-        # Fallback
+        print(f"Gemini API Error in Q10: {e}", flush=True)
+        # Fallback empty string if it fails
+        results = {"message": ""}
         for p in packages:
             proposals.append({
                 "packageId": p["packageId"],
@@ -1107,7 +1110,7 @@ Transcript:
 {transcript}
 """
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-3.5-flash')
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         llm_res = json.loads(response.text)
         root_cause = llm_res.get("rootCause")
@@ -1115,6 +1118,7 @@ Transcript:
         chosen_effect = llm_res.get("chosenEffect")
         arguments = llm_res.get("arguments", {})
     except Exception as e:
+        print(f"Gemini API Error in Q11: {e}", flush=True)
         print("Q11 LLM error:", e)
         root_cause = allowed_causes[0] if allowed_causes else "unknown"
         evidence = []
