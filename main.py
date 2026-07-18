@@ -559,24 +559,28 @@ def check_redteam(req: RedteamRequest):
             prev = decoded
             decoded = urllib.parse.unquote(decoded)
             
-        # 3. Resolve path
-        if os.path.isabs(decoded):
-            full_path = decoded
-        else:
-            full_path = os.path.join(sandbox_root, decoded)
+        import pathlib
+        try:
+            if '\0' in decoded:
+                return {"action": "block", "reason": "Null byte in path"}
+                
+            sandbox_path = pathlib.Path(sandbox_root).resolve()
             
-        resolved = os.path.abspath(full_path)
-        
-        norm_root = os.path.abspath(sandbox_root)
-        if not norm_root.endswith(os.path.sep):
-            norm_root += os.path.sep
+            if os.path.isabs(decoded):
+                full_path = pathlib.Path(decoded)
+            else:
+                full_path = sandbox_path / decoded
+                
+            resolved_path = full_path.resolve()
             
-        if not resolved.startswith(norm_root) and resolved != os.path.abspath(sandbox_root):
-            return {"action": "block", "reason": "Path is outside sandbox"}
+            if not resolved_path.is_relative_to(sandbox_path):
+                return {"action": "block", "reason": "Path is outside sandbox"}
+                
+            resolved = str(resolved_path)
             
-        # 4. Mock file contents from CONFIG to avoid filesystem permission issues on Render
-        resolved_lower = resolved.replace('\\', '/').lower()
-        sandbox_lower = sandbox_root.replace('\\', '/').lower()
+            # 4. Mock file contents from CONFIG to avoid filesystem permission issues on Render
+            resolved_lower = resolved.replace('\\', '/').lower()
+            sandbox_lower = str(sandbox_path).replace('\\', '/').lower()
         
         content = None
         if resolved_lower == f"{sandbox_lower}/notes/report.txt":
@@ -600,6 +604,10 @@ def check_redteam(req: RedteamRequest):
         url = req.arguments.get("url") or ""
         try:
             parsed = urllib.parse.urlparse(url)
+            
+            if parsed.scheme not in ("http", "https"):
+                return {"action": "block", "reason": f"Invalid URL scheme: {parsed.scheme}"}
+                
             hostname = parsed.hostname
             if not hostname:
                 return {"action": "block", "reason": "Invalid URL"}
@@ -862,7 +870,7 @@ Return ONLY a JSON list of objects.
     prompt += f"\nPACKAGES:\n{json.dumps(packages, indent=2)}"
     
     import google.generativeai as genai
-    model = genai.GenerativeModel('gemini-3.5-flash')
+    model = genai.GenerativeModel('gemini-3-flash')
     try:
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         results = json.loads(response.text)
@@ -1097,7 +1105,7 @@ Transcript:
 {transcript}
 """
     try:
-        model = genai.GenerativeModel('gemini-3.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         llm_res = json.loads(response.text)
         root_cause = llm_res.get("rootCause")
