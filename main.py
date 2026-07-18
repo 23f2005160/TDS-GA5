@@ -11,6 +11,7 @@ import uuid
 import time
 import httpx
 from typing import List, Dict, Any, Optional
+from collections import deque
 
 app = FastAPI(title="GA-5 Universal Solver Monolith")
 
@@ -27,6 +28,52 @@ CONFIG = {}
 Q9_CACHE = {}
 Q10_TASKS = {}
 Q11_RUNS = {}
+DEBUG_LOGS = deque(maxlen=100)
+
+# ==============================================================================
+# Middleware for Request Logging and Debugging
+# ==============================================================================
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    body_bytes = b""
+    if request.method in ("POST", "PUT", "PATCH"):
+        try:
+            body_bytes = await request.body()
+            async def receive():
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            request._receive = receive
+        except Exception:
+            pass
+
+    start_time = time.time()
+    response = None
+    error_message = None
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        error_message = str(e)
+        response = Response(status_code=500, content=f"Internal Server Error: {e}")
+        
+    duration = time.time() - start_time
+    
+    log_entry = {
+        "timestamp": time.time(),
+        "method": request.method,
+        "url": str(request.url),
+        "headers": dict(request.headers),
+        "body": body_bytes.decode('utf-8', errors='ignore')[:2000],
+        "status_code": response.status_code if response else 500,
+        "duration_ms": int(duration * 1000),
+        "error": error_message
+    }
+    DEBUG_LOGS.append(log_entry)
+    print(f"LOG: {request.method} {request.url.path} -> {log_entry['status_code']} ({log_entry['duration_ms']}ms)", flush=True)
+    return response
+
+@app.get("/debug/logs")
+def get_debug_logs():
+    return list(DEBUG_LOGS)
 
 # ==============================================================================
 # Helper functions & Startup Config
@@ -38,14 +85,18 @@ def load_student_config():
     if not email:
         print("⚠️ WARNING: STUDENT_EMAIL env var is not set! Q3, Q5, Q7, Q8 endpoints may fail.", flush=True)
         return
-    try:
-        # Run node generator.js <email>
-        res = subprocess.run(["node", "generator.js", email], capture_output=True, text=True, check=True)
-        CONFIG = json.loads(res.stdout)
-        print("✅ Successfully loaded student configurations!", flush=True)
-        print(json.dumps(CONFIG, indent=2), flush=True)
-    except Exception as e:
-        print(f"❌ Failed to generate student configurations: {e}", flush=True)
+        
+    # Try running with 'node', fallback to 'nodejs'
+    for cmd in ["node", "nodejs"]:
+        try:
+            res = subprocess.run([cmd, "generator.js", email], capture_output=True, text=True, check=True)
+            CONFIG = json.loads(res.stdout)
+            print(f"✅ Successfully loaded student configurations using '{cmd}'!", flush=True)
+            return
+        except Exception as e:
+            print(f"ℹ️ Try with '{cmd}' failed: {e}", flush=True)
+            
+    print("❌ Failed to generate student configurations using both 'node' and 'nodejs'.", flush=True)
 
 def setup_q8_files():
     if not CONFIG or "q8" not in CONFIG:
