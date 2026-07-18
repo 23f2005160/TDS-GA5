@@ -156,6 +156,7 @@ class ProrationRequest(BaseModel):
     spec: str
 
 @app.post("/q2/charge")
+@app.post("/charge")
 def calculate_proration(req: ProrationRequest):
     if req.spec == "v1":
         charge = (req.new_price - req.old_price) * (req.days_remaining / 30.0)
@@ -248,6 +249,7 @@ class ScanRequest(BaseModel):
     skill: str
 
 @app.post("/q4/scan")
+@app.post("/scan")
 def scan_skill(req: ScanRequest):
     skill = req.skill
     categories = []
@@ -505,6 +507,7 @@ def hash_dossier(dossier):
     return hashlib.sha256(compact.encode('utf-8')).hexdigest()
 
 @app.post("/q9/mailroom")
+@app.post("/v1/mailroom/actions")
 async def mailroom_handler(request: Request):
     body = await request.json()
     op = body.get("operation")
@@ -1085,6 +1088,40 @@ async def get_incident(runId: str):
         "status": run["status"],
         "diagnosis": run["diagnosis"]
     }
+
+# ==============================================================================
+# Dynamic /check Router for Q3, Q5, and Q8
+# ==============================================================================
+
+@app.post("/check")
+async def check_router(request: Request):
+    body = await request.json()
+    
+    # Q5 payload has "budget_tokens" or "steps"
+    if "budget_tokens" in body or "steps" in body:
+        try:
+            req = BudgetRequest(**body)
+            return check_budget_loop(req)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Q5 validation error: {e}")
+            
+    # Q8 payload has "arguments" and "tool"
+    elif "arguments" in body:
+        try:
+            req = RedteamRequest(**body)
+            return check_redteam(req)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Q8 validation error: {e}")
+            
+    # Q3 payload has "tool" but not "arguments"
+    elif "tool" in body:
+        try:
+            req = GuardrailRequest(**body)
+            return check_guardrail(req)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Q3 validation error: {e}")
+            
+    raise HTTPException(status_code=400, detail="Unknown check payload")
 
 if __name__ == "__main__":
     import uvicorn
