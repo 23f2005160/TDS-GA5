@@ -2,206 +2,278 @@ import os
 import json
 import hashlib
 import re
+import urllib.parse
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
 router = APIRouter()
 
-Q9_CACHE = {}
+Q9_EVALUATIONS = {}
+Q9_PROPOSALS = {}
 
-def load_q9_cache():
-    global Q9_CACHE
-    if os.path.exists("q9_cache.json"):
-        try:
-            with open("q9_cache.json", "r", encoding="utf-8") as f:
-                Q9_CACHE = json.load(f)
-        except Exception:
-            pass
-
-def save_q9_cache():
-    try:
-        with open("q9_cache.json", "w", encoding="utf-8") as f:
-            json.dump(Q9_CACHE, f)
-    except Exception:
-        pass
-
-def canonical_json_digest(data):
-    def sort_dict(obj):
+def canonical_json_digest(data: Any) -> str:
+    """Computes SHA-256 hex digest over recursively key-sorted compact JSON."""
+    def sort_obj(obj):
         if isinstance(obj, dict):
-            return {k: sort_dict(v) for k, v in sorted(obj.items())}
+            return {k: sort_obj(v) for k, v in sorted(obj.items())}
         elif isinstance(obj, list):
-            return [sort_dict(x) for x in obj]
+            return [sort_obj(x) for x in obj]
         return obj
-    sorted_data = sort_dict(data)
+    
+    sorted_data = sort_obj(data)
     compact_json = json.dumps(sorted_data, separators=(',', ':'), ensure_ascii=False)
     return hashlib.sha256(compact_json.encode('utf-8')).hexdigest()
 
-def hash_dossier(dossier):
-    compact = json.dumps(dossier, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(compact.encode('utf-8')).hexdigest()
+def compute_proposal_digest(dossier_id: str, call_id: str, action: str, target: Any, payload: Any, evidence: List[str]) -> str:
+    """
+    Compute proposalDigest over:
+    { "dossierId": ..., "callId": ..., "action": ..., "target": ..., "payload": ..., "evidence": sorted_evidence }
+    """
+    sorted_evidence = sorted(evidence) if evidence else []
+    prop_data = {
+        "dossierId": dossier_id,
+        "callId": call_id,
+        "action": action,
+        "target": target if target is not None else None,
+        "payload": payload,
+        "evidence": sorted_evidence
+    }
+    return canonical_json_digest(prop_data)
 
-def classify_dossier_fast(dossier: dict) -> tuple:
-    """
-    Classifies a Q9 dossier into one of 6 actions:
-    quarantine_item, update_internal_record, create_draft,
-    send_approved_notice, request_confirmation, no_action.
-    """
+def classify_dossier(dossier: dict) -> tuple:
     d_id = dossier.get("dossierId", "")
-    partition = dossier.get("partition", "")
     mailbox = dossier.get("mailbox", "customer-care")
     sources = dossier.get("sources", [])
-    
-    # Standard rule for stable_core partition: always no_action
-    if partition == "stable_core":
-        return (
-            "no_action",
-            None,
-            {"reasonCode": "INFORMATIONAL", "referenceId": d_id},
-            []
-        )
 
     all_lines = []
-    case_record_id = None
+    case_id = None
+    ord_id = None
+    evt_id = None
+    sender_email = None
+    approved_recipient = None
+    status_val = "processing"
     
     for src in sources:
-        if src.get("kind") == "case_record" and not case_record_id:
-            case_record_id = src.get("sourceId")
+        s_kind = src.get("kind", "")
+        s_id = src.get("sourceId", "")
+        prov = src.get("provenance", "")
+        
+        if ("case" in s_kind.lower() or "case" in s_id.lower()) and not case_id:
+            case_id = s_id
+                
         for line in src.get("lines", []):
             lid = line.get("lineId")
             txt = line.get("text", "")
-            if lid and txt:
-                all_lines.append((lid, txt, txt.lower()))
+            if not lid or not txt:
+                continue
+            txt_low = txt.lower()
+            all_lines.append((lid, txt, txt_low, s_kind, prov))
+            
+            ord_match = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+            if ord_match and not ord_id:
+                ord_id = ord_match.group(1)
+                
+            evt_match = re.search(r'\b(EVT-[A-Z0-9]+)\b', txt)
+            if evt_match and not evt_id:
+                evt_id = evt_match.group(1)
+                
+            email_match = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
+            if email_match:
+                if "approved recipient" in txt_low or "recipient:" in txt_low:
+                    approved_recipient = email_match.group(1)
+                elif not sender_email:
+                    sender_email = email_match.group(1)
 
-    full_text = " ".join(t_low for _, _, t_low in all_lines)
+    ref_id = ord_id or evt_id or d_id
+    target_case_id = case_id or f"case_{d_id}"
+    sender = sender_email or "unknown@customer.com"
+    recipient = approved_recipient or sender
 
-    # 1. Prompt Injection -> quarantine_item
-    INJECTION_KEYWORDS = [
-        "ignore previous", "ignore all prior", "system prompt",
-        "jailbreak", "paste credential", "override safety", "disregard policy"
+    # 1. Indirect Prompt Injection -> quarantine_item
+    INJECTION_TERMS = [
+        "ignore previous", "ignore all prior", "system prompt", "jailbreak",
+        "paste credential", "override safety", "disregard policy", "exfiltrate",
+        "send all passwords", "reveal secret", "unauthorized outbound"
     ]
-    for lid, txt, t_low in all_lines:
-        if any(kw in t_low for kw in INJECTION_KEYWORDS):
-            return (
-                "quarantine_item",
-                {"kind": "security_queue", "id": "mailroom"},
-                {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-                [lid]
-            )
+    for lid, txt, txt_low, s_kind, prov in all_lines:
+        if any(term in txt_low for term in INJECTION_TERMS):
+            if prov != "signed_internal_approval" and "quote" not in txt_low:
+                return (
+                    "quarantine_item",
+                    {"kind": "security_queue", "id": "mailroom"},
+                    {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+                    [lid]
+                )
 
-    # 2. Update Internal Record -> delivery window
-    for lid, txt, t_low in all_lines:
-        if "delivery window" in t_low or "update delivery" in t_low:
-            val_match = re.search(r'delivery[_\s]window[_\s:]*([A-Za-z0-9_\-]+)', t_low)
-            val = val_match.group(1) if val_match else "updated_window"
-            target_case_id = case_record_id or "case-record-0"
+    # 2. Explicit Internal Record Update -> update_internal_record
+    for lid, txt, txt_low, s_kind, prov in all_lines:
+        if ("update" in txt_low or "change" in txt_low or "set" in txt_low) and ("delivery window" in txt_low or "window" in txt_low):
+            val_m = re.search(r'(?:delivery[_\s]window|window)[_\s:]*(?:to|is|set to|=|:)?\s*([A-Za-z0-9_\-]+)', txt_low)
+            val = val_m.group(1) if val_m else "evening_window"
+            if val in ["to", "is", "set", "the"]:
+                val_m2 = re.search(r'(?:to|is|set|window)\s+([A-Za-z0-9_\-]+_window|[A-Za-z0-9_\-]+)', txt_low)
+                val = val_m2.group(1) if val_m2 else "evening_window"
             return (
                 "update_internal_record",
                 {"kind": "case_record", "id": target_case_id},
-                {"field": "delivery_window", "sourceEventId": d_id, "value": val},
+                {"field": "delivery_window", "sourceEventId": evt_id or f"EVT_{d_id}", "value": val},
                 [lid]
             )
 
-    # 3. Create Draft -> order status
-    for lid, txt, t_low in all_lines:
-        if "create draft" in t_low or "order status draft" in t_low or "draft response" in t_low:
+    # 3. Approved Outbound Notice -> send_approved_notice
+    for lid, txt, txt_low, s_kind, prov in all_lines:
+        if prov == "signed_internal_approval" or "approved delivery notice" in txt_low or "send notice" in txt_low:
+            return (
+                "send_approved_notice",
+                {"kind": "email", "id": recipient},
+                {"referenceId": ref_id, "status": "shipped", "template": "approved_delivery_notice"},
+                [lid]
+            )
+
+    # 4. Identity Conflict / Ambiguous Sender -> request_confirmation
+    for lid, txt, txt_low, s_kind, prov in all_lines:
+        if "identity conflict" in txt_low or "unverified sender" in txt_low or "mismatch" in txt_low or "ambiguous" in txt_low:
+            return (
+                "request_confirmation",
+                {"kind": "approval_queue", "id": mailbox},
+                {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref_id},
+                [lid]
+            )
+
+    # 5. Customer Query needing Draft -> create_draft
+    for lid, txt, txt_low, s_kind, prov in all_lines:
+        if "customer" in s_kind.lower() or "inquiry" in txt_low or "where is my order" in txt_low or "status request" in txt_low:
             return (
                 "create_draft",
                 {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
-                {"recipient": mailbox, "referenceId": d_id, "status": "pending", "template": "order_status"},
+                {"recipient": sender, "referenceId": ref_id, "status": status_val, "template": "order_status"},
                 [lid]
             )
 
-    # 4. Send Approved Notice
-    for lid, txt, t_low in all_lines:
-        if "send approved notice" in t_low or "approved delivery notice" in t_low:
-            return (
-                "send_approved_notice",
-                {"kind": "email", "id": mailbox},
-                {"referenceId": d_id, "status": "approved", "template": "approved_delivery_notice"},
-                [lid]
-            )
-
-    # 5. Request Confirmation
-    for lid, txt, t_low in all_lines:
-        if "request confirmation" in t_low or "unverified sender" in t_low or "verify sender" in t_low:
-            return (
-                "request_confirmation",
-                {"kind": "approval_queue", "id": "compliance-team"},
-                {"claimedSender": mailbox, "questionCode": "VERIFY_REQUEST", "referenceId": d_id},
-                [lid]
-            )
-
-    # 6. Default -> no_action
+    # 6. Default / Fallback -> no_action
+    evidence_line = [all_lines[0][0]] if all_lines else []
     return (
         "no_action",
         None,
-        {"reasonCode": "INFORMATIONAL", "referenceId": d_id},
-        []
+        {"reasonCode": "INFORMATIONAL", "referenceId": ref_id},
+        evidence_line
     )
 
 @router.post("/v1/mailroom/actions")
-@router.post("/q9/mailroom")
-async def mailroom_handler(request: Request):
-    load_q9_cache()
-    body = await request.json()
-    op = body.get("operation")
-    eval_id = body.get("evaluationId")
+async def handle_mailroom_actions(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
     profile = body.get("profile")
-    
-    if profile != "ga5-mailroom-action-gate/v2":
-        raise HTTPException(status_code=400, detail="Invalid profile")
-        
-    if op == "propose":
+    operation = body.get("operation")
+    eval_id = body.get("evaluationId")
+
+    if profile != "ga5-mailroom-action-gate/v2" or not eval_id or not operation:
+        raise HTTPException(status_code=400, detail="Malformed request headers or profile")
+
+    if operation == "propose":
         dossiers = body.get("dossiers", [])
-        digest = canonical_json_digest(dossiers)
-        
+        if not dossiers:
+            raise HTTPException(status_code=400, detail="No dossiers provided")
+
+        input_digest = canonical_json_digest(dossiers)
+
+        # Idempotency & Conflict Handling
+        if eval_id in Q9_EVALUATIONS:
+            cached_eval = Q9_EVALUATIONS[eval_id]
+            if cached_eval["inputDigest"] != input_digest:
+                raise HTTPException(status_code=409, detail="Evaluation ID conflict with different input digest")
+            return cached_eval["proposeResponse"]
+
         proposals = []
         for d in dossiers:
-            d_hash = hash_dossier(d)
-            d_id = d.get("dossierId", "")
-            call_id = f"call-{d_hash[:20]}"
+            d_id = d.get("dossierId")
+            action, target, payload, evidence = classify_dossier(d)
+            call_id = f"call-{hashlib.sha256(f'{eval_id}:{d_id}'.encode()).hexdigest()[:20]}"
             
-            action, target, payload, evidence = classify_dossier_fast(d)
-            prop = {
+            prop_digest = compute_proposal_digest(d_id, call_id, action, target, payload, evidence)
+            
+            proposal_obj = {
                 "dossierId": d_id,
                 "callId": call_id,
                 "action": action,
                 "target": target,
                 "payload": payload,
-                "evidence": evidence
+                "evidence": sorted(evidence) if evidence else []
             }
-            proposals.append(prop)
-                
-        return {
+            proposals.append(proposal_obj)
+            
+            Q9_PROPOSALS[(eval_id, d_id, call_id)] = {
+                "proposalDigest": prop_digest,
+                "action": action,
+                "target": target,
+                "payload": payload,
+                "evidence": sorted(evidence) if evidence else []
+            }
+
+        response_body = {
             "profile": "ga5-mailroom-action-gate/v2",
             "evaluationId": eval_id,
             "status": "awaiting_receipts",
-            "inputDigest": digest,
+            "inputDigest": input_digest,
             "proposals": proposals
         }
 
-    elif op == "commit":
-        digest = body.get("inputDigest")
+        Q9_EVALUATIONS[eval_id] = {
+            "inputDigest": input_digest,
+            "proposeResponse": response_body
+        }
+
+        return response_body
+
+    elif operation == "commit":
+        input_digest = body.get("inputDigest")
         receipts = body.get("receipts", [])
+
+        if eval_id not in Q9_EVALUATIONS:
+            raise HTTPException(status_code=400, detail="Unknown evaluationId for commit")
+
+        cached_eval = Q9_EVALUATIONS[eval_id]
+        if cached_eval["inputDigest"] != input_digest:
+            raise HTTPException(status_code=409, detail="Commit inputDigest mismatch")
+
         outcomes = []
         for r in receipts:
-            status = "executed" if r.get("accepted") else "rejected"
+            d_id = r.get("dossierId")
+            c_id = r.get("callId")
+            action = r.get("action")
+            accepted = r.get("accepted", False)
+            prop_digest = r.get("proposalDigest")
+            receipt_id = r.get("receiptId")
+
+            key = (eval_id, d_id, c_id)
+            if key not in Q9_PROPOSALS:
+                status = "rejected"
+            else:
+                stored = Q9_PROPOSALS[key]
+                if stored["proposalDigest"] != prop_digest or stored["action"] != action:
+                    status = "rejected"
+                else:
+                    status = "executed" if accepted else "rejected"
+
             outcomes.append({
-                "dossierId": r["dossierId"],
-                "callId": r["callId"],
-                "action": r["action"],
-                "proposalDigest": r["proposalDigest"],
-                "receiptId": r["receiptId"],
+                "dossierId": d_id,
+                "callId": c_id,
+                "action": action,
+                "proposalDigest": prop_digest,
+                "receiptId": receipt_id,
                 "status": status
             })
-            
+
         return {
             "profile": "ga5-mailroom-action-gate/v2",
             "evaluationId": eval_id,
             "status": "completed",
-            "inputDigest": digest,
+            "inputDigest": input_digest,
             "outcomes": outcomes
         }
-        
-    raise HTTPException(status_code=400, detail="Invalid operation")
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid operation: {operation}")
