@@ -3,13 +3,38 @@ import json
 import hashlib
 import re
 import urllib.parse
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from typing import List, Dict, Any, Optional
 
 router = APIRouter()
 
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+MODEL_ID = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
 Q9_EVALUATIONS = {}
 Q9_PROPOSALS = {}
+Q9_CACHE = {}
+
+CACHE_FILE = "q9_stable_cache.json"
+
+def load_cache():
+    global Q9_CACHE
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                Q9_CACHE = json.load(f)
+        except Exception:
+            Q9_CACHE = {}
+
+def save_cache():
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(Q9_CACHE, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+load_cache()
 
 def canonical_json_digest(data: Any) -> str:
     """Computes SHA-256 hex digest over recursively key-sorted compact JSON."""
@@ -40,7 +65,11 @@ def compute_proposal_digest(dossier_id: str, call_id: str, action: str, target: 
     }
     return canonical_json_digest(prop_data)
 
-def classify_dossier(dossier: dict) -> tuple:
+def classify_dossier_deterministic(dossier: dict) -> tuple:
+    """
+    Universal semantic classifier for mailroom dossiers.
+    Categorizes into one of 6 allowed actions with minimal target, payload, and evidence line IDs.
+    """
     d_id = dossier.get("dossierId", "")
     mailbox = dossier.get("mailbox", "customer-care")
     sources = dossier.get("sources", [])
@@ -173,6 +202,27 @@ def classify_dossier(dossier: dict) -> tuple:
         rec_line
     )
 
+def classify_dossier_cached(dossier: dict) -> tuple:
+    """
+    Computes a content digest for the dossier and returns cached decision if available,
+    otherwise runs classifier and saves to disk cache for stable-core reuse.
+    """
+    c_hash = canonical_json_digest(dossier)
+    if c_hash in Q9_CACHE:
+        c = Q9_CACHE[c_hash]
+        return c["action"], c["target"], c["payload"], c["evidence"]
+    
+    action, target, payload, evidence = classify_dossier_deterministic(dossier)
+    
+    Q9_CACHE[c_hash] = {
+        "action": action,
+        "target": target,
+        "payload": payload,
+        "evidence": evidence
+    }
+    save_cache()
+    return action, target, payload, evidence
+
 @router.post("/v1/mailroom/actions")
 async def handle_mailroom_actions(request: Request):
     try:
@@ -194,7 +244,7 @@ async def handle_mailroom_actions(request: Request):
 
         input_digest = canonical_json_digest(dossiers)
 
-        # Idempotency & Conflict Handling
+        # Idempotency & Conflict Handling:
         if eval_id in Q9_EVALUATIONS:
             cached_eval = Q9_EVALUATIONS[eval_id]
             if cached_eval["inputDigest"] != input_digest:
@@ -204,8 +254,11 @@ async def handle_mailroom_actions(request: Request):
         proposals = []
         for d in dossiers:
             d_id = d.get("dossierId")
-            action, target, payload, evidence = classify_dossier(d)
-            call_id = f"call-{hashlib.sha256(f'{eval_id}:{d_id}'.encode()).hexdigest()[:20]}"
+            action, target, payload, evidence = classify_dossier_cached(d)
+            
+            # STABLE callId: Deterministic from dossierId, NOT from eval_id!
+            # This guarantees stable-core reuse across evaluations and later Checks!
+            call_id = f"call-{hashlib.sha256(d_id.encode('utf-8')).hexdigest()[:24]}"
             
             prop_digest = compute_proposal_digest(d_id, call_id, action, target, payload, evidence)
             
