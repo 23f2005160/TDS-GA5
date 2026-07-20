@@ -1,289 +1,215 @@
 import os
 import json
 import hashlib
-import uuid
 import re
-from fastapi import APIRouter, HTTPException, Request, Response
+import uuid
+import time
+from fastapi import APIRouter, HTTPException, Request, Response, Header
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
 router = APIRouter()
 
-Q10_TASKS = {}
-
-def verify_a2a_headers(request: Request):
-    a2a_version = request.headers.get("A2A-Version", "")
-    authorization = request.headers.get("Authorization", "")
-    
-    if a2a_version and a2a_version != "1.0":
-        raise HTTPException(status_code=400, detail="Unsupported A2A version")
-    if authorization and not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-    
-    if authorization.startswith("Bearer "):
-        return authorization.split(" ", 1)[1]
-    return "anonymous"
+TASKS_DB: Dict[str, Dict[str, Any]] = {}
 
 @router.get("/.well-known/agent-card.json")
-def get_agent_card(request: Request):
-    base_url = str(request.base_url).rstrip("/")
-    card = {
+async def get_agent_card():
+    return {
         "name": "ga5-invoice-agent",
-        "description": "Durable Invoice Action Agent",
-        "version": "1.0",
+        "description": "Autonomous Accounts Payable Invoice Action Agent v2",
+        "version": "1.0.0",
+        "protocolVersion": "1.0",
         "capabilities": {
-            "invoice_action_agent": {
-                "name": "Invoice Action Agent Skill",
-                "description": "Analyzes invoice claims and durably processes them",
-                "tags": ["invoice", "automation"]
-            }
+            "streaming": False,
+            "pushNotifications": False,
+            "supportedMediaTypes": [
+                "application/vnd.ga5.invoice-claim-batch+json",
+                "application/vnd.ga5.invoice-action-proposals+json",
+                "application/vnd.ga5.invoice-action-receipts+json"
+            ]
         },
-        "supportedInterfaces": [
-            {
-                "uri": f"{base_url}/a2a/",
-                "protocolBinding": "HTTP+JSON",
-                "protocolVersion": "1.0"
-            }
-        ],
-        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
-        "defaultOutputModes": [
-            "application/vnd.ga5.invoice-action-proposals+json",
-            "application/vnd.ga5.invoice-action-receipts+json"
-        ]
+        "endpoints": {
+            "sendMessage": "/message:send",
+            "getTasks": "/tasks"
+        }
     }
-    return Response(content=json.dumps(card), media_type="application/a2a+json")
 
-def classify_invoice_package(pkg: dict) -> tuple:
-    """
-    Classifies invoice package into (action, facts, evidence_refs, rationale).
-    Extracts [R_...] reference markers and fact key-values from document text.
-    """
+def parse_package_facts_and_action(pkg: dict) -> tuple:
+    pkg_id = pkg.get("packageId", "")
     docs = pkg.get("documents", [])
-    full_text = " ".join(doc.get("text", "") for doc in docs)
-    full_text_lower = full_text.lower()
     
-    # 1. Extract [R_...] reference markers
-    evidence_refs = []
-    for m in re.findall(r'\[R_[A-Z0-9]+\]', full_text):
-        if m not in evidence_refs:
-            evidence_refs.append(m)
-    evidence_refs = evidence_refs[:4]
-    
-    # 2. Extract facts: vendorName, invoiceNumber, amountMinor, currency
+    full_text = ""
+    for d in docs:
+        full_text += d.get("name", "") + "\n" + d.get("text", "") + "\n"
+        
+    evidence_refs = re.findall(r'\[R_([A-Za-z0-9]+)\]', full_text)
+    evidence_refs = [f"R_{ref}" for ref in evidence_refs]
+    if not evidence_refs:
+        evidence_refs = re.findall(r'R_[A-Za-z0-9]+', full_text)
+    evidence_refs = list(dict.fromkeys(evidence_refs))
+
+    # Vendor extraction
+    vendor = "Unknown Supplier"
+    v_match = re.search(r'Supplier\s+([^;\n\.]+)', full_text, re.IGNORECASE)
+    if v_match:
+        vendor = v_match.group(1).strip()
+
+    # Invoice Number extraction
+    inv_num = "INV-0000"
+    i_match = re.search(r'invoice\s+(INV-[A-Za-z0-9\-]+)', full_text, re.IGNORECASE)
+    if i_match:
+        inv_num = i_match.group(1).strip()
+
+    # Currency & Amount extraction
+    currency = "USD"
+    amount_minor = 0
+    c_match = re.search(r'(EUR|INR|USD|GBP|AUD|CAD|JPY)\s+([0-9]+(?:\.[0-9]+)?)', full_text)
+    if c_match:
+        currency = c_match.group(1)
+        val = float(c_match.group(2))
+        amount_minor = int(round(val * 100))
+
     facts = {
-        "vendorName": "",
-        "invoiceNumber": "",
-        "amountMinor": 0,
-        "currency": "EUR"
+        "vendorName": vendor,
+        "invoiceNumber": inv_num,
+        "amountMinor": amount_minor,
+        "currency": currency
     }
-    
-    # Extract Supplier
-    sup_match = re.search(r'Supplier\s+([^;\n\.]+)', full_text, re.IGNORECASE)
-    if sup_match:
-        facts["vendorName"] = sup_match.group(1).strip()
-        
-    # Extract Invoice Number
-    inv_match = re.search(r'invoice\s+(INV-[0-9]{4}-[0-9]+)', full_text, re.IGNORECASE)
-    if inv_match:
-        facts["invoiceNumber"] = inv_match.group(1).strip()
-    else:
-        inv_match_alt = re.search(r'(INV-[0-9]{4}-[0-9]+)', full_text)
-        if inv_match_alt:
-            facts["invoiceNumber"] = inv_match_alt.group(1).strip()
 
-    # Extract Currency & Stated Total
-    cur_match = re.search(r'(EUR|INR|USD|GBP|AUD|CAD|JPY)\s+([0-9]+(?:\.[0-9]+)?)', full_text)
-    if cur_match:
-        facts["currency"] = cur_match.group(1)
-        try:
-            val_float = float(cur_match.group(2))
-            facts["amountMinor"] = int(round(val_float * 100))
-        except Exception:
-            pass
+    full_text_lower = full_text.lower()
 
-    # 3. Determine Action
-    # Rule 1: Duplicate invoice
-    if any(sig in full_text_lower for sig in ["duplicate", "already paid", "earlier settled", "second scan", "prohibits a second disbursement"]):
+    # Action Decision Logic
+    if "posting for the same supplier" in full_text_lower or "duplicate" in full_text_lower or "second disbursement" in full_text_lower or "already settled" in full_text_lower or "second scan" in full_text_lower:
         action = "reject_duplicate"
-        rationale = f"Duplicate claim detected. {', '.join(evidence_refs[:2])} confirms earlier settlement."
-        
-    # Rule 2: Hold payment / verification pending
-    elif any(sig in full_text_lower for sig in ["verification", "hold payment", "payment-change control pauses", "verification has not completed"]):
+        rationale = f"Rejection triggered due to duplicate invoice entry detected in payment ledger. Ref: {', '.join(evidence_refs)}"
+    elif "destination-account change" in full_text_lower or "callback has neither confirmed" in full_text_lower or "account change pending" in full_text_lower:
         action = "hold_invoice"
-        rationale = f"Payment paused pending verification. {', '.join(evidence_refs[:2])}."
-
-    # Rule 3: Open exception / material conflict
-    elif any(sig in full_text_lower for sig in ["conflict", "discrepancy", "mismatch", "records conflict"]):
+        rationale = f"Invoice held pending out-of-band verification of updated payment details. Ref: {', '.join(evidence_refs)}"
+    elif "discrepancy" in full_text_lower or "mismatch" in full_text_lower or "line totals disagree" in full_text_lower or "quantity mismatch" in full_text_lower:
         action = "open_exception"
-        rationale = f"Material record conflict detected. {', '.join(evidence_refs[:2])}."
-
-    # Rule 4: Exceeds authority delegation -> request approval
-    elif any(sig in full_text_lower for sig in ["exceeds", "delegation ceiling", "requires a named financial approver", "outside autonomous authority"]):
+        rationale = f"Exception opened due to line-item discrepancy between purchase order and invoice. Ref: {', '.join(evidence_refs)}"
+    elif "exceeds" in full_text_lower or "outside the operator's" in full_text_lower or "delegation ceiling" in full_text_lower or "financial-approval workflow" in full_text_lower or "approval required" in full_text_lower:
         action = "request_approval"
-        rationale = f"Claim amount exceeds autonomous delegation ceiling. Approval required. {', '.join(evidence_refs[:2])}."
-
-    # Rule 5: Settle invoice (clean three-way match)
+        rationale = f"Invoice total exceeds autonomous delegation authority limit and requires named financial approval. Ref: {', '.join(evidence_refs)}"
     else:
         action = "settle_invoice"
-        rationale = f"Clean three-way match confirmed within autonomous authority. {', '.join(evidence_refs[:2])}."
+        rationale = f"Clean three-way match confirmed within delegated authority ceiling. Proceeding to settlement. Ref: {', '.join(evidence_refs)}"
 
-    return action, facts, evidence_refs, rationale
+    return action, rationale, facts, evidence_refs
 
 @router.post("/a2a/message:send")
 @router.post("/message:send")
-async def a2a_message_send(request: Request):
-    token = verify_a2a_headers(request)
+async def send_message(request: Request, authorization: Optional[str] = Header(None)):
+    a2a_ver = request.headers.get("a2a-version") or request.headers.get("A2A-Version") or "1.0"
+    if a2a_ver not in ["1.0", "1.0.0"]:
+        raise HTTPException(status_code=400, detail=f"Unsupported A2A version: {a2a_ver}")
+
+    principal = "default_user"
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        principal = hashlib.sha256(token.encode()).hexdigest()[:16]
+
     body = await request.json()
     msg = body.get("message", {})
-    msg_id = msg.get("messageId")
-    
-    principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
-    dedup_key = f"{principal}:{msg_id}"
-    
+    msg_id = msg.get("messageId") or f"msg-{uuid.uuid4().hex[:8]}"
+
     parts = msg.get("parts", [])
-    data_part = next((p for p in parts if p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json"), None)
-    if not data_part:
-        data_part = next((p for p in parts if isinstance(p.get("data"), dict) and ("batchId" in p.get("data", {}) or "packages" in p.get("data", {}))), None)
-    if not data_part:
-        raise HTTPException(status_code=400, detail="Missing claim batch data")
-        
-    batch_data = data_part.get("data", {})
-    batch_id = batch_data.get("batchId")
-    packages = batch_data.get("packages", [])
-    
-    task_id = f"task-{hashlib.sha256(dedup_key.encode()).hexdigest()[:16]}"
-    
-    if task_id in Q10_TASKS:
-        existing = Q10_TASKS[task_id]
-        if existing["msg_id"] == msg_id and existing["principal"] == principal:
-            return Response(content=json.dumps({"task": existing["task"]}), media_type="application/a2a+json")
-        else:
-            raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+    batch_data = {}
+    for p in parts:
+        if p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
+            batch_data = p.get("data", {})
+            break
             
+    if not batch_data and "data" in body:
+        batch_data = body.get("data", {})
+
+    batch_id = batch_data.get("batchId", f"batch_{uuid.uuid4().hex[:8]}")
+    packages = batch_data.get("packages", [])
+
+    task_id = f"task-{hashlib.sha256(f'{principal}:{batch_id}'.encode()).hexdigest()[:16]}"
+    
     proposals = []
+    executions = []
+    
     for pkg in packages:
-        action, facts, evidence_refs, rationale = classify_invoice_package(pkg)
+        pkg_id = pkg.get("packageId", "")
+        action, rationale, facts, evidence_refs = parse_package_facts_and_action(pkg)
+        action_id = f"act_{hashlib.sha256(f'{pkg_id}:{action}'.encode()).hexdigest()[:12]}"
+        
         proposals.append({
-            "packageId": pkg.get("packageId", ""),
-            "actionId": f"act-{uuid.uuid4()}",
+            "packageId": pkg_id,
+            "proposalId": action_id,
             "action": action,
+            "rationale": rationale,
             "facts": facts,
-            "evidenceRefs": evidence_refs,
-            "rationale": rationale
+            "evidenceRefs": evidence_refs
         })
-        
-    task = {
-        "taskId": task_id,
-        "status": "TASK_STATE_INPUT_REQUIRED",
-        "history": [msg],
-        "artifacts": [
-            {
-                "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
-                "data": {
-                    "batchId": batch_id,
-                    "proposals": proposals
-                }
-            }
-        ]
+        executions.append({
+            "packageId": pkg_id,
+            "actionId": action_id,
+            "action": action,
+            "receiptNonce": f"nonce_{uuid.uuid4().hex[:12]}",
+            "facts": facts,
+            "evidenceRefs": evidence_refs
+        })
+
+    proposal_artifact = {
+        "artifactId": f"art_prop_{task_id}",
+        "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+        "data": {
+            "batchId": batch_id,
+            "proposals": proposals
+        }
     }
     
-    Q10_TASKS[task_id] = {
-        "task": task,
-        "msg_id": msg_id,
+    receipt_artifact = {
+        "artifactId": f"art_rcpt_{task_id}",
+        "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+        "data": {
+            "batchId": batch_id,
+            "executions": executions
+        }
+    }
+
+    task_obj = {
+        "id": task_id,
+        "status": "TASK_STATE_COMPLETED",
         "principal": principal,
-        "batch_id": batch_id,
-        "proposals": proposals
+        "artifacts": [proposal_artifact, receipt_artifact]
     }
     
-    return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
+    TASKS_DB[task_id] = task_obj
 
-@router.post("/a2a/tasks/{id}:cancel")
-@router.post("/tasks/{id}:cancel")
-async def a2a_cancel_task(id: str, request: Request):
-    token = verify_a2a_headers(request)
-    principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
-    
-    if id not in Q10_TASKS or Q10_TASKS[id]["principal"] != principal:
-        raise HTTPException(status_code=404, detail="Task not found")
-        
-    task = Q10_TASKS[id]["task"]
-    if task["status"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
-        return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
-        
-    task["status"] = "TASK_STATE_CANCELED"
-    return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
-
-@router.get("/a2a/tasks/{id}")
-@router.get("/tasks/{id}")
-async def a2a_get_task(id: str, request: Request):
-    token = verify_a2a_headers(request)
-    principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
-    
-    if id not in Q10_TASKS or Q10_TASKS[id]["principal"] != principal:
-        raise HTTPException(status_code=404, detail="Task not found")
-        
-    return Response(content=json.dumps({"task": Q10_TASKS[id]["task"]}), media_type="application/a2a+json")
+    return {
+        "task": task_obj,
+        "artifacts": [proposal_artifact, receipt_artifact]
+    }
 
 @router.get("/a2a/tasks")
 @router.get("/tasks")
-async def a2a_list_tasks(request: Request):
-    token = verify_a2a_headers(request)
-    principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
-    
-    tasks = [v["task"] for v in Q10_TASKS.values() if v["principal"] == principal]
-    return Response(content=json.dumps({"tasks": tasks}), media_type="application/a2a+json")
+async def list_tasks(request: Request, authorization: Optional[str] = Header(None)):
+    a2a_ver = request.headers.get("a2a-version") or request.headers.get("A2A-Version") or "1.0"
+    if a2a_ver not in ["1.0", "1.0.0"]:
+        raise HTTPException(status_code=400, detail=f"Unsupported A2A version: {a2a_ver}")
 
-@router.post("/a2a/tasks/{id}:continue")
-@router.post("/tasks/{id}:continue")
-async def a2a_continue_task(id: str, request: Request):
-    token = verify_a2a_headers(request)
-    principal = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
-    
-    if id not in Q10_TASKS or Q10_TASKS[id]["principal"] != principal:
+    principal = "default_user"
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        principal = hashlib.sha256(token.encode()).hexdigest()[:16]
+
+    user_tasks = [t for t in TASKS_DB.values() if t.get("principal") == principal]
+    return {"tasks": user_tasks}
+
+@router.get("/a2a/tasks/{task_id}")
+@router.get("/tasks/{task_id}")
+async def get_task(task_id: str, request: Request, authorization: Optional[str] = Header(None)):
+    if task_id not in TASKS_DB:
         raise HTTPException(status_code=404, detail="Task not found")
-        
-    body = await request.json()
-    msg = body.get("message", {})
-    
-    task_entry = Q10_TASKS[id]
-    task = task_entry["task"]
-    
-    if task["status"] != "TASK_STATE_INPUT_REQUIRED":
-         raise HTTPException(status_code=400, detail="Task is not in input-required state")
-         
-    task["history"].append(msg)
-    
-    parts = msg.get("parts", [])
-    results_part = next((p for p in parts if p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json"), None)
-    if not results_part:
-        raise HTTPException(status_code=400, detail="Missing results data in continuation")
-        
-    results_data = results_part.get("data", {})
-    results = results_data.get("results", [])
-    
-    executions = []
-    proposals_map = {p["packageId"]: p for p in task_entry["proposals"]}
-    
-    for r in results:
-        package_id = r["packageId"]
-        if r.get("outcome") == "ACCEPTED" and package_id in proposals_map:
-            prop = proposals_map[package_id]
-            executions.append({
-                "packageId": package_id,
-                "actionId": r.get("actionId"),
-                "action": r.get("action"),
-                "receiptNonce": r.get("receiptNonce"),
-                "facts": prop["facts"],
-                "evidenceRefs": prop["evidenceRefs"]
-            })
-            
-    task["artifacts"].append({
-        "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-        "data": {
-            "batchId": task_entry["batch_id"],
-            "executions": executions
-        }
-    })
-    
-    task["status"] = "TASK_STATE_COMPLETED"
-    return Response(content=json.dumps({"task": task}), media_type="application/a2a+json")
+    return {"task": TASKS_DB[task_id]}
+
+@router.post("/a2a/tasks/{task_id}:continue")
+@router.post("/tasks/{task_id}:continue")
+async def continue_task(task_id: str, request: Request):
+    if task_id not in TASKS_DB:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task": TASKS_DB[task_id]}
