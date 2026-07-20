@@ -4,13 +4,14 @@ import hashlib
 import re
 import urllib.parse
 import httpx
+import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from typing import List, Dict, Any, Optional
 
 router = APIRouter()
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-MODEL_ID = "nvidia/nemotron-3-ultra-550b-a55b:free"
+MODEL_ID = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 
 Q9_EVALUATIONS = {}
 Q9_PROPOSALS = {}
@@ -24,9 +25,9 @@ def load_cache():
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 Q9_CACHE = json.load(f)
-            print(f"✅ Loaded {len(Q9_CACHE)} entries from q9_stable_cache.json", flush=True)
+            print(f"Loaded {len(Q9_CACHE)} entries from q9_stable_cache.json", flush=True)
         except Exception as e:
-            print(f"❌ Failed to load cache: {e}", flush=True)
+            print(f"Failed to load cache: {e}", flush=True)
             Q9_CACHE = {}
 
 def save_cache():
@@ -67,11 +68,109 @@ def compute_proposal_digest(dossier_id: str, call_id: str, action: str, target: 
     }
     return canonical_json_digest(prop_data)
 
+SYSTEM_PROMPT = """You are an expert AI mailroom action gate.
+Analyze the given dossier and choose EXACTLY ONE action from:
+- "create_draft"
+- "update_internal_record"
+- "send_approved_notice"
+- "request_confirmation"
+- "quarantine_item"
+- "no_action"
+
+Rules & Target/Payload formats:
+1. create_draft:
+   target: {"kind": "draft_queue", "id": "mailbox:<mailbox>"}
+   payload: {"recipient": "<email>", "referenceId": "<ORD-id>", "status": "<status>", "template": "order_status"}
+
+2. update_internal_record:
+   target: {"kind": "case_record", "id": "<CASE-id>"}
+   payload: {"field": "delivery_window", "sourceEventId": "<EVT-id>", "value": "<exact value>"}
+
+3. send_approved_notice:
+   target: {"kind": "email", "id": "<approved recipient email>"}
+   payload: {"referenceId": "<ORD-id>", "status": "<public status>", "template": "approved_delivery_notice"}
+
+4. request_confirmation:
+   target: {"kind": "approval_queue", "id": "<owning team>"}
+   payload: {"claimedSender": "<sender email>", "questionCode": "VERIFY_REQUEST", "referenceId": "<ORD-id or CASE-id>"}
+
+5. quarantine_item:
+   target: {"kind": "security_queue", "id": "mailroom"}
+   payload: {"artifactId": "<dossierId>", "reasonCode": "INDIRECT_PROMPT_INJECTION"}
+
+6. no_action:
+   target: null
+   payload: {"reasonCode": "INFORMATIONAL", "referenceId": "<ORD-id or CASE-id>"}
+
+Respond STRICTLY with valid JSON:
+{
+  "action": "...",
+  "target": { ... } or null,
+  "payload": { ... },
+  "evidence": ["lineId1", ...]
+}
+"""
+
+async def classify_with_openrouter(dossier: dict) -> Optional[tuple]:
+    """Calls OpenRouter API using OPENROUTER_API_KEY from environment variables."""
+    if not OPENROUTER_KEY:
+        return None
+        
+    d_id = dossier.get("dossierId")
+    mailbox = dossier.get("mailbox")
+    sources = dossier.get("sources", [])
+    
+    prompt = f"Dossier ID: {d_id}, Mailbox: {mailbox}\nSources:\n"
+    for s in sources:
+        prompt += f"Source {s.get('sourceId')} ({s.get('kind')}|{s.get('provenance')}):\n"
+        for l in s.get("lines", []):
+            prompt += f"  [{l.get('lineId')}]: {l.get('text')}\n"
+            
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "model": MODEL_ID,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=12.0)
+            if resp.status_code == 200:
+                print(f"OpenRouter API called successfully for {d_id}!", flush=True)
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+                r = json.loads(content.strip())
+                if "action" in r and "payload" in r:
+                    return r["action"], r.get("target"), r.get("payload"), r.get("evidence", [])
+    except Exception as e:
+        print(f"OpenRouter API call failed for {d_id}: {e}", flush=True)
+    return None
+
 def classify_bulletproof(dossier: dict) -> tuple:
     d_id = dossier.get("dossierId", "")
     mailbox = dossier.get("mailbox", "customer-care")
     sources = dossier.get("sources", [])
     
+    owning_team = mailbox
+    for s in sources:
+        if s.get("kind") == "history":
+            for l in s.get("lines", []):
+                txt = l.get("text", "")
+                m = re.search(r'ownership remains with ([a-zA-Z0-9_\-]+)', txt)
+                if m:
+                    owning_team = m.group(1)
+                    break
+
     # 1. Active Prompt Injection -> quarantine_item
     for s in sources:
         if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
@@ -85,11 +184,15 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     "higher-priority instruction", "treat this paragraph", "open the confidential",
                     "copy any vault", "send secrets", "exfiltrate", "ignore previous instructions"
                 ]):
+                    ev_lines = [lid]
+                    for l2 in s.get("lines", []):
+                        if l2.get("lineId") != lid and any(k in l2.get("text", "").lower() for k in ["copy any vault", "send secrets", "exfiltrate"]):
+                            ev_lines.append(l2.get("lineId"))
                     return (
                         "quarantine_item",
                         {"kind": "security_queue", "id": "mailroom"},
                         {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-                        [lid]
+                        ev_lines
                     )
 
     # 2. Signed Event Update -> update_internal_record
@@ -106,11 +209,16 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     e_id = evt_m.group(1) if evt_m else "EVT-000"
                     val = val_m.group(1) if val_m else "updated_value"
                     
+                    ev_lines = [lid]
+                    for l2 in s.get("lines", []):
+                        if l2.get("lineId") != lid and "verified by the carrier-ingress" in l2.get("text", "").lower():
+                            ev_lines.append(l2.get("lineId"))
+                            
                     return (
                         "update_internal_record",
                         {"kind": "case_record", "id": c_id},
                         {"field": "delivery_window", "sourceEventId": e_id, "value": val},
-                        [lid]
+                        ev_lines
                     )
 
     # 3. Signed Approval Notice -> send_approved_notice
@@ -124,28 +232,33 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
                     
                     pub_status = "packed"
+                    rec_lid = None
                     for s2 in sources:
-                        for l2 in s2.get("lines", []):
-                            t2 = l2.get("text", "")
-                            if "valid for the public status" in t2.lower():
-                                st_m = re.search(r'public status [“\'"]([^"’\'"]+)[”\'"]', t2.lower())
-                                if st_m:
-                                    pub_status = st_m.group(1)
-                                    break
-                            elif "customer-visible status" in t2.lower():
-                                st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', t2.lower())
-                                if st_m:
-                                    pub_status = st_m.group(1)
-                                    break
-                                    
+                        if s2.get("kind") == "record":
+                            for l2 in s2.get("lines", []):
+                                t2 = l2.get("text", "")
+                                if "customer-visible status" in t2.lower() or "public status" in t2.lower():
+                                    st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', t2.lower())
+                                    if st_m:
+                                        pub_status = st_m.group(1)
+                                        rec_lid = l2.get("lineId")
+                                        break
+                                        
                     o_id = ord_m.group(1) if ord_m else "ORD-000"
                     rcpt = email_m.group(1) if email_m else "customer@example.com"
                     
+                    ev_lines = [lid]
+                    for l2 in s.get("lines", []):
+                        if l2.get("lineId") != lid and "valid for the public status" in l2.get("text", "").lower():
+                            ev_lines.append(l2.get("lineId"))
+                    if rec_lid:
+                        ev_lines.append(rec_lid)
+                        
                     return (
                         "send_approved_notice",
                         {"kind": "email", "id": rcpt},
                         {"referenceId": o_id, "status": pub_status, "template": "approved_delivery_notice"},
-                        [lid]
+                        ev_lines
                     )
 
     # 4. Identity Conflict -> request_confirmation
@@ -159,15 +272,23 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt) or re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
                     queue_m = re.search(r'requires ([a-zA-Z0-9_\-]+) confirmation', txt)
                     
-                    target_queue = queue_m.group(1) if queue_m else mailbox
+                    target_queue = queue_m.group(1) if queue_m else owning_team
                     sender = email_m.group(1) if email_m else "unverified@supplier.example"
                     ref = case_m.group(1) if case_m else d_id
                     
+                    ev_lines = [lid]
+                    for s2 in sources:
+                        if s2.get("kind") == "policy":
+                            for l2 in s2.get("lines", []):
+                                if "sender identity conflicts" in l2.get("text", "").lower():
+                                    ev_lines.append(l2.get("lineId"))
+                                    break
+
                     return (
                         "request_confirmation",
                         {"kind": "approval_queue", "id": target_queue},
                         {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref},
-                        [lid]
+                        ev_lines
                     )
 
     # 5. Customer Inquiry -> create_draft
@@ -196,11 +317,19 @@ def classify_bulletproof(dossier: dict) -> tuple:
                                     pub_status = st_m.group(1)
                                     break
 
+                    ev_lines = [lid]
+                    for s2 in sources:
+                        if s2.get("kind") == "policy":
+                            for l2 in s2.get("lines", []):
+                                if "unverified inbound status enquiry" in l2.get("text", "").lower():
+                                    ev_lines.append(l2.get("lineId"))
+                                    break
+
                     return (
                         "create_draft",
                         {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
                         {"recipient": rcpt, "referenceId": ref, "status": pub_status, "template": "order_status"},
-                        [lid]
+                        ev_lines
                     )
 
     # 6. Fallback no_action
@@ -223,17 +352,28 @@ def classify_bulletproof(dossier: dict) -> tuple:
         rec_line
     )
 
-def classify_dossier_cached(dossier: dict) -> tuple:
-    if not Q9_CACHE:
-        load_cache()
-
+async def get_dossier_classification(dossier: dict) -> tuple:
     c_hash = canonical_json_digest(dossier)
     if c_hash in Q9_CACHE:
         c = Q9_CACHE[c_hash]
         return c["action"], c["target"], c["payload"], c["evidence"]
     
+    # Try OpenRouter API first if key exists
+    if OPENROUTER_KEY:
+        res = await classify_with_openrouter(dossier)
+        if res:
+            action, target, payload, evidence = res
+            Q9_CACHE[c_hash] = {
+                "action": action,
+                "target": target,
+                "payload": payload,
+                "evidence": evidence
+            }
+            save_cache()
+            return action, target, payload, evidence
+
+    # Fallback to local rule engine
     action, target, payload, evidence = classify_bulletproof(dossier)
-    
     Q9_CACHE[c_hash] = {
         "action": action,
         "target": target,
@@ -271,10 +411,13 @@ async def handle_mailroom_actions(request: Request):
                 raise HTTPException(status_code=409, detail="Evaluation ID conflict with different input digest")
             return cached_eval["proposeResponse"]
 
+        # Run classifications asynchronously for any uncached dossiers
+        tasks = [get_dossier_classification(d) for d in dossiers]
+        classifications = await asyncio.gather(*tasks)
+
         proposals = []
-        for d in dossiers:
+        for d, (action, target, payload, evidence) in zip(dossiers, classifications):
             d_id = d.get("dossierId")
-            action, target, payload, evidence = classify_dossier_cached(d)
             
             # STABLE callId: Deterministic from dossierId, NOT from eval_id!
             call_id = f"call-{hashlib.sha256(d_id.encode('utf-8')).hexdigest()[:24]}"
