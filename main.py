@@ -181,7 +181,6 @@ def setup_q8_files():
 def startup_event():
     load_student_config()
     setup_q8_files()
-    load_q9_cache()
 
 @app.get("/")
 def read_root():
