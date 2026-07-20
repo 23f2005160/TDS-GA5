@@ -45,118 +45,132 @@ def classify_dossier(dossier: dict) -> tuple:
     mailbox = dossier.get("mailbox", "customer-care")
     sources = dossier.get("sources", [])
 
-    all_lines = []
-    case_id = None
-    ord_id = None
-    evt_id = None
-    sender_email = None
-    approved_recipient = None
-    status_val = "processing"
-    
-    for src in sources:
-        s_kind = src.get("kind", "")
-        s_id = src.get("sourceId", "")
-        prov = src.get("provenance", "")
-        
-        if ("case" in s_kind.lower() or "case" in s_id.lower()) and not case_id:
-            case_id = s_id
-                
-        for line in src.get("lines", []):
-            lid = line.get("lineId")
+    # 1. Check active prompt injection -> quarantine_item
+    for s in sources:
+        if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
+            for line in s.get("lines", []):
+                txt = line.get("text", "")
+                lid = line.get("lineId")
+                txt_low = txt.lower()
+                if any(kw in txt_low for kw in ["quotes", "example", "drill", "archived training", "bulletin"]):
+                    continue
+                if any(k in txt_low for k in [
+                    "higher-priority instruction", "treat this paragraph", "open the confidential",
+                    "copy any vault", "send secrets", "exfiltrate", "ignore previous instructions"
+                ]):
+                    return (
+                        "quarantine_item",
+                        {"kind": "security_queue", "id": "mailroom"},
+                        {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+                        [lid]
+                    )
+
+    # 2. Check signed event update -> update_internal_record
+    for s in sources:
+        if s.get("kind") == "event" and s.get("provenance") == "signed_internal":
+            for line in s.get("lines", []):
+                txt = line.get("text", "")
+                lid = line.get("lineId")
+                if "authorizes case" in txt.lower() and "unrelated" not in txt.lower():
+                    case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
+                    evt_m = re.search(r'\b(EVT-[A-Z0-9]+)\b', txt)
+                    val_m = re.search(r'exact value [“\'"]([^"’\'"]+)[”\'"]', txt) or re.search(r'exact value ([^\s\.]+)', txt)
+                    c_id = case_m.group(1) if case_m else "CASE-000"
+                    e_id = evt_m.group(1) if evt_m else "EVT-000"
+                    val = val_m.group(1) if val_m else "updated_value"
+                    return (
+                        "update_internal_record",
+                        {"kind": "case_record", "id": c_id},
+                        {"field": "delivery_window", "sourceEventId": e_id, "value": val},
+                        [lid]
+                    )
+
+    # 3. Check signed approval notice -> send_approved_notice
+    for s in sources:
+        if s.get("kind") == "approval" and s.get("provenance") == "signed_internal":
+            for line in s.get("lines", []):
+                txt = line.get("text", "")
+                lid = line.get("lineId")
+                if "permits one delivery-status notice" in txt.lower() and "unrelated" not in txt.lower():
+                    ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                    email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
+                    
+                    pub_status = "packed"
+                    for s2 in sources:
+                        if s2.get("kind") == "record":
+                            for l2 in s2.get("lines", []):
+                                st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', l2.get("text", "").lower())
+                                if st_m:
+                                    pub_status = st_m.group(1)
+                                    break
+                                    
+                    o_id = ord_m.group(1) if ord_m else "ORD-000"
+                    rcpt = email_m.group(1) if email_m else "customer@example.com"
+                    return (
+                        "send_approved_notice",
+                        {"kind": "email", "id": rcpt},
+                        {"referenceId": o_id, "status": pub_status, "template": "approved_delivery_notice"},
+                        [lid]
+                    )
+
+    # 4. Check identity conflict -> request_confirmation
+    for s in sources:
+        if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
+            for line in s.get("lines", []):
+                txt = line.get("text", "")
+                lid = line.get("lineId")
+                if "does not match" in txt.lower() or "identity conflict" in txt.lower():
+                    email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
+                    case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt) or re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                    sender = email_m.group(1) if email_m else "unverified@supplier.example"
+                    ref = case_m.group(1) if case_m else d_id
+                    return (
+                        "request_confirmation",
+                        {"kind": "approval_queue", "id": mailbox},
+                        {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref},
+                        [lid]
+                    )
+
+    # 5. Check customer inquiry -> create_draft
+    for s in sources:
+        if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
+            for line in s.get("lines", []):
+                txt = line.get("text", "")
+                lid = line.get("lineId")
+                if "prepare an update" in txt.lower() or "status enquiry" in txt.lower() or "fulfilment state" in txt.lower():
+                    ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                    sender_m = None
+                    for s2 in sources:
+                        for l2 in s2.get("lines", []):
+                            if "sender address" in l2.get("text", "").lower():
+                                sender_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', l2.get("text", ""))
+                    rcpt = sender_m.group(1) if sender_m else "customer@example.com"
+                    ref = ord_m.group(1) if ord_m else d_id
+                    return (
+                        "create_draft",
+                        {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
+                        {"recipient": rcpt, "referenceId": ref, "status": "processing", "template": "order_status"},
+                        [lid]
+                    )
+
+    # 6. Fallback no_action
+    rec_line = []
+    ref = d_id
+    for s in sources:
+        for line in s.get("lines", []):
             txt = line.get("text", "")
-            if not lid or not txt:
-                continue
-            txt_low = txt.lower()
-            all_lines.append((lid, txt, txt_low, s_kind, prov))
-            
-            ord_match = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
-            if ord_match and not ord_id:
-                ord_id = ord_match.group(1)
-                
-            evt_match = re.search(r'\b(EVT-[A-Z0-9]+)\b', txt)
-            if evt_match and not evt_id:
-                evt_id = evt_match.group(1)
-                
-            email_match = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
-            if email_match:
-                if "approved recipient" in txt_low or "recipient:" in txt_low:
-                    approved_recipient = email_match.group(1)
-                elif not sender_email:
-                    sender_email = email_match.group(1)
+            lid = line.get("lineId")
+            ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt) or re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
+            if ord_m and ref == d_id:
+                ref = ord_m.group(1)
+            if not rec_line and lid:
+                rec_line = [lid]
 
-    ref_id = ord_id or evt_id or d_id
-    target_case_id = case_id or f"case_{d_id}"
-    sender = sender_email or "unknown@customer.com"
-    recipient = approved_recipient or sender
-
-    # 1. Indirect Prompt Injection -> quarantine_item
-    INJECTION_TERMS = [
-        "ignore previous", "ignore all prior", "system prompt", "jailbreak",
-        "paste credential", "override safety", "disregard policy", "exfiltrate",
-        "send all passwords", "reveal secret", "unauthorized outbound"
-    ]
-    for lid, txt, txt_low, s_kind, prov in all_lines:
-        if any(term in txt_low for term in INJECTION_TERMS):
-            if prov != "signed_internal_approval" and "quote" not in txt_low:
-                return (
-                    "quarantine_item",
-                    {"kind": "security_queue", "id": "mailroom"},
-                    {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-                    [lid]
-                )
-
-    # 2. Explicit Internal Record Update -> update_internal_record
-    for lid, txt, txt_low, s_kind, prov in all_lines:
-        if ("update" in txt_low or "change" in txt_low or "set" in txt_low) and ("delivery window" in txt_low or "window" in txt_low):
-            val_m = re.search(r'(?:delivery[_\s]window|window)[_\s:]*(?:to|is|set to|=|:)?\s*([A-Za-z0-9_\-]+)', txt_low)
-            val = val_m.group(1) if val_m else "evening_window"
-            if val in ["to", "is", "set", "the"]:
-                val_m2 = re.search(r'(?:to|is|set|window)\s+([A-Za-z0-9_\-]+_window|[A-Za-z0-9_\-]+)', txt_low)
-                val = val_m2.group(1) if val_m2 else "evening_window"
-            return (
-                "update_internal_record",
-                {"kind": "case_record", "id": target_case_id},
-                {"field": "delivery_window", "sourceEventId": evt_id or f"EVT_{d_id}", "value": val},
-                [lid]
-            )
-
-    # 3. Approved Outbound Notice -> send_approved_notice
-    for lid, txt, txt_low, s_kind, prov in all_lines:
-        if prov == "signed_internal_approval" or "approved delivery notice" in txt_low or "send notice" in txt_low:
-            return (
-                "send_approved_notice",
-                {"kind": "email", "id": recipient},
-                {"referenceId": ref_id, "status": "shipped", "template": "approved_delivery_notice"},
-                [lid]
-            )
-
-    # 4. Identity Conflict / Ambiguous Sender -> request_confirmation
-    for lid, txt, txt_low, s_kind, prov in all_lines:
-        if "identity conflict" in txt_low or "unverified sender" in txt_low or "mismatch" in txt_low or "ambiguous" in txt_low:
-            return (
-                "request_confirmation",
-                {"kind": "approval_queue", "id": mailbox},
-                {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref_id},
-                [lid]
-            )
-
-    # 5. Customer Query needing Draft -> create_draft
-    for lid, txt, txt_low, s_kind, prov in all_lines:
-        if "customer" in s_kind.lower() or "inquiry" in txt_low or "where is my order" in txt_low or "status request" in txt_low:
-            return (
-                "create_draft",
-                {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
-                {"recipient": sender, "referenceId": ref_id, "status": status_val, "template": "order_status"},
-                [lid]
-            )
-
-    # 6. Default / Fallback -> no_action
-    evidence_line = [all_lines[0][0]] if all_lines else []
     return (
         "no_action",
         None,
-        {"reasonCode": "INFORMATIONAL", "referenceId": ref_id},
-        evidence_line
+        {"reasonCode": "INFORMATIONAL", "referenceId": ref},
+        rec_line
     )
 
 @router.post("/v1/mailroom/actions")
