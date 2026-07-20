@@ -67,12 +67,13 @@ async def log_requests(request: Request, call_next):
     duration = time.time() - start_time
     path = request.url.path.lower()
     
+    body_limit = 500000 if any(k in path for k in ["q9", "mailroom", "q10", "q11", "incidents", "agent-card"]) else 2000
     log_entry = {
         "timestamp": time.time(),
         "method": request.method,
         "url": str(request.url),
         "headers": dict(request.headers),
-        "body": body_bytes.decode('utf-8', errors='ignore')[:2000],
+        "body": body_bytes.decode('utf-8', errors='ignore')[:body_limit],
         "status_code": response.status_code if response else 500,
         "duration_ms": int(duration * 1000),
         "error": error_message
