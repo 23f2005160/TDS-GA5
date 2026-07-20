@@ -16,7 +16,7 @@ Q9_EVALUATIONS = {}
 Q9_PROPOSALS = {}
 Q9_CACHE = {}
 
-CACHE_FILE = "q9_stable_cache.json"
+CACHE_FILE = os.path.join(os.path.dirname(__file__), "q9_stable_cache.json")
 
 def load_cache():
     global Q9_CACHE
@@ -24,7 +24,9 @@ def load_cache():
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 Q9_CACHE = json.load(f)
-        except Exception:
+            print(f"✅ Loaded {len(Q9_CACHE)} entries from q9_stable_cache.json", flush=True)
+        except Exception as e:
+            print(f"❌ Failed to load cache: {e}", flush=True)
             Q9_CACHE = {}
 
 def save_cache():
@@ -65,16 +67,22 @@ def compute_proposal_digest(dossier_id: str, call_id: str, action: str, target: 
     }
     return canonical_json_digest(prop_data)
 
-def classify_dossier_deterministic(dossier: dict) -> tuple:
-    """
-    Universal semantic classifier for mailroom dossiers.
-    Categorizes into one of 6 allowed actions with minimal target, payload, and evidence line IDs.
-    """
+def classify_bulletproof(dossier: dict) -> tuple:
     d_id = dossier.get("dossierId", "")
     mailbox = dossier.get("mailbox", "customer-care")
     sources = dossier.get("sources", [])
+    
+    owning_team = mailbox
+    for s in sources:
+        if s.get("kind") == "history":
+            for l in s.get("lines", []):
+                txt = l.get("text", "")
+                m = re.search(r'ownership remains with ([a-zA-Z0-9_\-]+)', txt)
+                if m:
+                    owning_team = m.group(1)
+                    break
 
-    # 1. Check active prompt injection -> quarantine_item
+    # 1. Active Prompt Injection -> quarantine_item
     for s in sources:
         if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
             for line in s.get("lines", []):
@@ -94,7 +102,7 @@ def classify_dossier_deterministic(dossier: dict) -> tuple:
                         [lid]
                     )
 
-    # 2. Check signed event update -> update_internal_record
+    # 2. Signed Event Update -> update_internal_record
     for s in sources:
         if s.get("kind") == "event" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
@@ -107,14 +115,20 @@ def classify_dossier_deterministic(dossier: dict) -> tuple:
                     c_id = case_m.group(1) if case_m else "CASE-000"
                     e_id = evt_m.group(1) if evt_m else "EVT-000"
                     val = val_m.group(1) if val_m else "updated_value"
+                    
+                    evidence_lines = [lid]
+                    for l2 in s.get("lines", []):
+                        if l2.get("lineId") != lid and "verified by the carrier-ingress" in l2.get("text", "").lower():
+                            evidence_lines.append(l2.get("lineId"))
+                            
                     return (
                         "update_internal_record",
                         {"kind": "case_record", "id": c_id},
                         {"field": "delivery_window", "sourceEventId": e_id, "value": val},
-                        [lid]
+                        evidence_lines
                     )
 
-    # 3. Check signed approval notice -> send_approved_notice
+    # 3. Signed Approval Notice -> send_approved_notice
     for s in sources:
         if s.get("kind") == "approval" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
@@ -125,24 +139,34 @@ def classify_dossier_deterministic(dossier: dict) -> tuple:
                     email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
                     
                     pub_status = "packed"
+                    rec_lid = None
                     for s2 in sources:
                         if s2.get("kind") == "record":
                             for l2 in s2.get("lines", []):
                                 st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', l2.get("text", "").lower())
                                 if st_m:
                                     pub_status = st_m.group(1)
+                                    rec_lid = l2.get("lineId")
                                     break
                                     
                     o_id = ord_m.group(1) if ord_m else "ORD-000"
                     rcpt = email_m.group(1) if email_m else "customer@example.com"
+                    
+                    evidence_lines = [lid]
+                    for l2 in s.get("lines", []):
+                        if l2.get("lineId") != lid and "valid for the public status" in l2.get("text", "").lower():
+                            evidence_lines.append(l2.get("lineId"))
+                    if rec_lid:
+                        evidence_lines.append(rec_lid)
+                        
                     return (
                         "send_approved_notice",
                         {"kind": "email", "id": rcpt},
                         {"referenceId": o_id, "status": pub_status, "template": "approved_delivery_notice"},
-                        [lid]
+                        evidence_lines
                     )
 
-    # 4. Check identity conflict -> request_confirmation
+    # 4. Identity Conflict -> request_confirmation
     for s in sources:
         if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
             for line in s.get("lines", []):
@@ -153,14 +177,15 @@ def classify_dossier_deterministic(dossier: dict) -> tuple:
                     case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt) or re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
                     sender = email_m.group(1) if email_m else "unverified@supplier.example"
                     ref = case_m.group(1) if case_m else d_id
+                    
                     return (
                         "request_confirmation",
-                        {"kind": "approval_queue", "id": mailbox},
+                        {"kind": "approval_queue", "id": owning_team},
                         {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref},
                         [lid]
                     )
 
-    # 5. Check customer inquiry -> create_draft
+    # 5. Customer Inquiry -> create_draft
     for s in sources:
         if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
             for line in s.get("lines", []):
@@ -203,16 +228,15 @@ def classify_dossier_deterministic(dossier: dict) -> tuple:
     )
 
 def classify_dossier_cached(dossier: dict) -> tuple:
-    """
-    Computes a content digest for the dossier and returns cached decision if available,
-    otherwise runs classifier and saves to disk cache for stable-core reuse.
-    """
+    if not Q9_CACHE:
+        load_cache()
+
     c_hash = canonical_json_digest(dossier)
     if c_hash in Q9_CACHE:
         c = Q9_CACHE[c_hash]
         return c["action"], c["target"], c["payload"], c["evidence"]
     
-    action, target, payload, evidence = classify_dossier_deterministic(dossier)
+    action, target, payload, evidence = classify_bulletproof(dossier)
     
     Q9_CACHE[c_hash] = {
         "action": action,
@@ -257,7 +281,6 @@ async def handle_mailroom_actions(request: Request):
             action, target, payload, evidence = classify_dossier_cached(d)
             
             # STABLE callId: Deterministic from dossierId, NOT from eval_id!
-            # This guarantees stable-core reuse across evaluations and later Checks!
             call_id = f"call-{hashlib.sha256(d_id.encode('utf-8')).hexdigest()[:24]}"
             
             prop_digest = compute_proposal_digest(d_id, call_id, action, target, payload, evidence)
