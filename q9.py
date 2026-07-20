@@ -82,7 +82,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     owning_team = m.group(1)
                     break
 
-    # 1. Active Prompt Injection -> quarantine_item
+    # 1. Active Prompt Injection -> quarantine_item (Minimal 1 Line)
     for s in sources:
         if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
             for line in s.get("lines", []):
@@ -102,7 +102,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
                         [lid]
                     )
 
-    # 2. Signed Event Update -> update_internal_record
+    # 2. Signed Event Update -> update_internal_record (Minimal 1 Line)
     for s in sources:
         if s.get("kind") == "event" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
@@ -116,19 +116,14 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     e_id = evt_m.group(1) if evt_m else "EVT-000"
                     val = val_m.group(1) if val_m else "updated_value"
                     
-                    evidence_lines = [lid]
-                    for l2 in s.get("lines", []):
-                        if l2.get("lineId") != lid and "verified by the carrier-ingress" in l2.get("text", "").lower():
-                            evidence_lines.append(l2.get("lineId"))
-                            
                     return (
                         "update_internal_record",
                         {"kind": "case_record", "id": c_id},
                         {"field": "delivery_window", "sourceEventId": e_id, "value": val},
-                        evidence_lines
+                        [lid]
                     )
 
-    # 3. Signed Approval Notice -> send_approved_notice
+    # 3. Signed Approval Notice -> send_approved_notice (Minimal 1 Line)
     for s in sources:
         if s.get("kind") == "approval" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
@@ -139,34 +134,31 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
                     
                     pub_status = "packed"
-                    rec_lid = None
                     for s2 in sources:
-                        if s2.get("kind") == "record":
-                            for l2 in s2.get("lines", []):
-                                st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', l2.get("text", "").lower())
+                        for l2 in s2.get("lines", []):
+                            t2 = l2.get("text", "")
+                            if "valid for the public status" in t2.lower():
+                                st_m = re.search(r'public status [“\'"]([^"’\'"]+)[”\'"]', t2.lower())
                                 if st_m:
                                     pub_status = st_m.group(1)
-                                    rec_lid = l2.get("lineId")
+                                    break
+                            elif "customer-visible status" in t2.lower():
+                                st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', t2.lower())
+                                if st_m:
+                                    pub_status = st_m.group(1)
                                     break
                                     
                     o_id = ord_m.group(1) if ord_m else "ORD-000"
                     rcpt = email_m.group(1) if email_m else "customer@example.com"
                     
-                    evidence_lines = [lid]
-                    for l2 in s.get("lines", []):
-                        if l2.get("lineId") != lid and "valid for the public status" in l2.get("text", "").lower():
-                            evidence_lines.append(l2.get("lineId"))
-                    if rec_lid:
-                        evidence_lines.append(rec_lid)
-                        
                     return (
                         "send_approved_notice",
                         {"kind": "email", "id": rcpt},
                         {"referenceId": o_id, "status": pub_status, "template": "approved_delivery_notice"},
-                        evidence_lines
+                        [lid]
                     )
 
-    # 4. Identity Conflict -> request_confirmation
+    # 4. Identity Conflict -> request_confirmation (Minimal 1 Line)
     for s in sources:
         if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
             for line in s.get("lines", []):
@@ -185,7 +177,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
                         [lid]
                     )
 
-    # 5. Customer Inquiry -> create_draft
+    # 5. Customer Inquiry -> create_draft (Minimal 1 Line)
     for s in sources:
         if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
             for line in s.get("lines", []):
@@ -207,7 +199,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
                         [lid]
                     )
 
-    # 6. Fallback no_action
+    # 6. Fallback no_action (Minimal 1 Line)
     rec_line = []
     ref = d_id
     for s in sources:
