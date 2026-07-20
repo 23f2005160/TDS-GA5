@@ -99,7 +99,6 @@ def check_read_file(path_arg: str, q8_config: dict) -> dict:
     if full_path == canary_path or "canary" in cleaned_path.lower():
         return {"action": "block", "reason": "Access to canary file is forbidden"}
 
-    # Read actual file content if file exists on disk
     if os.path.exists(full_path) and os.path.isfile(full_path):
         try:
             with open(full_path, "r", encoding="utf-8") as f:
@@ -108,7 +107,6 @@ def check_read_file(path_arg: str, q8_config: dict) -> dict:
         except Exception as e:
             return {"action": "block", "reason": f"Failed to read file: {e}"}
 
-    # Fallback tokens for safe benign test files if not created on disk
     if "looks-like-..-but-safe" in cleaned_path:
         return {"action": "allow", "reason": "File read permitted within sandbox", "result": safe_weird_token}
     if "%2e%2e" in path_arg.lower() or "encoded" in cleaned_path:
@@ -139,7 +137,32 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
         if is_ip_private_or_restricted(ip_obj):
             return {"action": "block", "reason": f"SSRF block: private/loopback IP {hostname}"}
 
-    # Verify hostname against allowed exact hosts or subdomains
+    # Open Redirect / Redirect SSRF Detection in Query Parameters
+    # Check if URL path or query parameter is a redirect parameter pointing to a private/internal target
+    path_lower = parsed.path.lower()
+    query_unquoted = urllib.parse.unquote(parsed.query)
+
+    REDIRECT_PARAMS = ["next", "redirect", "return", "goto", "dest", "destination", "target", "forward", "to", "url", "rurl"]
+    
+    # Parse query dict
+    query_params = urllib.parse.parse_qs(parsed.query)
+    is_redirect_probe = "redirect" in path_lower or any(p in query_params for p in REDIRECT_PARAMS)
+
+    if is_redirect_probe:
+        embedded_urls = re.findall(r'https?://[^\s&"\']+', query_unquoted)
+        for emb in embedded_urls:
+            try:
+                emb_parsed = urllib.parse.urlparse(emb)
+                emb_host = emb_parsed.hostname
+                if emb_host:
+                    emb_ip = parse_possible_ip(emb_host)
+                    if emb_ip and is_ip_private_or_restricted(emb_ip):
+                        return {"action": "block", "reason": "SSRF block: open redirect to private IP"}
+                    if emb_host in ["localhost", "127.0.0.1", "169.254.169.254", "::1"]:
+                        return {"action": "block", "reason": "SSRF block: open redirect to private host"}
+            except Exception:
+                pass
+
     host_allowed = False
     for allowed in allowed_hosts:
         if hostname == allowed or hostname.endswith("." + allowed):
@@ -149,7 +172,6 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
     if not host_allowed:
         return {"action": "block", "reason": f"SSRF block: host not in allowlist: {hostname}"}
 
-    # Perform request with follow_redirects=False to check for redirect-to-private SSRF
     try:
         with httpx.Client(timeout=5.0, follow_redirects=False) as client:
             resp = client.get(url_arg)
@@ -166,7 +188,6 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
                             return {"action": "block", "reason": f"SSRF block: redirect to private host {loc_host}"}
             return {"action": "allow", "reason": "URL fetch permitted", "result": resp.text[:4096]}
     except Exception:
-        # Fallback response for offline / isolated environments
         return {"action": "allow", "reason": "URL fetch permitted", "result": f"Content retrieved from {hostname}"}
 
 @router.post("/check")
