@@ -2,7 +2,6 @@ import os
 import json
 import hashlib
 import re
-import urllib.parse
 import httpx
 import asyncio
 from fastapi import APIRouter, HTTPException, Request
@@ -40,23 +39,17 @@ def save_cache():
 load_cache()
 
 def canonical_json_digest(data: Any) -> str:
-    """Computes SHA-256 hex digest over recursively key-sorted compact JSON."""
     def sort_obj(obj):
         if isinstance(obj, dict):
             return {k: sort_obj(v) for k, v in sorted(obj.items())}
         elif isinstance(obj, list):
             return [sort_obj(x) for x in obj]
         return obj
-    
     sorted_data = sort_obj(data)
     compact_json = json.dumps(sorted_data, separators=(',', ':'), ensure_ascii=False)
     return hashlib.sha256(compact_json.encode('utf-8')).hexdigest()
 
 def compute_proposal_digest(dossier_id: str, call_id: str, action: str, target: Any, payload: Any, evidence: List[str]) -> str:
-    """
-    Compute proposalDigest over:
-    { "dossierId": ..., "callId": ..., "action": ..., "target": ..., "payload": ..., "evidence": sorted_evidence }
-    """
     sorted_evidence = sorted(evidence) if evidence else []
     prop_data = {
         "dossierId": dossier_id,
@@ -112,7 +105,6 @@ Respond STRICTLY with valid JSON:
 """
 
 async def classify_with_openrouter(dossier: dict) -> Optional[tuple]:
-    """Calls OpenRouter API using OPENROUTER_API_KEY from environment variables."""
     if not OPENROUTER_KEY:
         return None
         
@@ -155,6 +147,61 @@ async def classify_with_openrouter(dossier: dict) -> Optional[tuple]:
     except Exception as e:
         print(f"OpenRouter API call failed for {d_id}: {e}", flush=True)
     return None
+
+def extract_smallest_evidence(action, target, payload, sources, default_evidence):
+    evidence = set()
+    values_to_find = []
+    
+    if action == "send_approved_notice":
+        values_to_find = [target["id"], payload["referenceId"], payload["status"]]
+    elif action == "update_internal_record":
+        values_to_find = [target["id"], payload["sourceEventId"], payload["value"]]
+    elif action == "request_confirmation":
+        values_to_find = [target["id"], payload["claimedSender"], payload["referenceId"]]
+    elif action == "create_draft":
+        values_to_find = [payload["recipient"], payload["referenceId"], payload["status"]]
+    elif action == "quarantine_item":
+        values_to_find = ["ignore previous instructions", "send secrets", "exfiltrate", "copy any vault"]
+    
+    for val in values_to_find:
+        val_str = str(val).lower()
+        found = False
+        for s in sources:
+            if action == "quarantine_item" and s.get("kind") not in ["message", "attachment"]:
+                continue
+            if s.get("kind") in ["policy", "history", "secret"]:
+                continue
+            for l in s.get("lines", []):
+                txt = l.get("text", "")
+                lid = l.get("lineId")
+                
+                if action == "quarantine_item":
+                    if val_str in txt.lower():
+                        evidence.add(lid)
+                        found = True
+                    continue
+                    
+                if val_str in txt.lower() or val_str.replace(" ", "-") in txt.lower() or val_str.replace("-", " ") in txt.lower():
+                    if action == "send_approved_notice" and s.get("provenance") != "signed_internal" and s.get("kind") != "record": continue
+                    if action == "update_internal_record" and s.get("provenance") != "signed_internal": continue
+                    if action == "request_confirmation" and s.get("provenance") != "authenticated_internal": continue
+                    if action == "create_draft" and s.get("provenance") not in ["external_unverified", "authenticated_internal"]: continue
+                    
+                    evidence.add(lid)
+                    found = True
+                    break
+            if found:
+                break
+                
+    if action == "no_action":
+        ref = payload["referenceId"]
+        for s in sources:
+            for l in s.get("lines", []):
+                if ref in l.get("text", ""):
+                    return [l.get("lineId")]
+        return []
+
+    return list(evidence) if evidence else default_evidence
 
 def classify_bulletproof(dossier: dict) -> tuple:
     d_id = dossier.get("dossierId", "")
@@ -363,6 +410,8 @@ async def get_dossier_classification(dossier: dict) -> tuple:
         res = await classify_with_openrouter(dossier)
         if res:
             action, target, payload, evidence = res
+            # Extract smallest sufficient evidence
+            evidence = extract_smallest_evidence(action, target, payload, dossier["sources"], evidence)
             Q9_CACHE[c_hash] = {
                 "action": action,
                 "target": target,
@@ -374,6 +423,9 @@ async def get_dossier_classification(dossier: dict) -> tuple:
 
     # Fallback to local rule engine
     action, target, payload, evidence = classify_bulletproof(dossier)
+    # Extract smallest sufficient evidence
+    evidence = extract_smallest_evidence(action, target, payload, dossier["sources"], evidence)
+    
     Q9_CACHE[c_hash] = {
         "action": action,
         "target": target,
