@@ -72,17 +72,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
     mailbox = dossier.get("mailbox", "customer-care")
     sources = dossier.get("sources", [])
     
-    owning_team = mailbox
-    for s in sources:
-        if s.get("kind") == "history":
-            for l in s.get("lines", []):
-                txt = l.get("text", "")
-                m = re.search(r'ownership remains with ([a-zA-Z0-9_\-]+)', txt)
-                if m:
-                    owning_team = m.group(1)
-                    break
-
-    # 1. Active Prompt Injection -> quarantine_item (Minimal 1 Line)
+    # 1. Active Prompt Injection -> quarantine_item
     for s in sources:
         if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
             for line in s.get("lines", []):
@@ -102,7 +92,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
                         [lid]
                     )
 
-    # 2. Signed Event Update -> update_internal_record (Minimal 1 Line)
+    # 2. Signed Event Update -> update_internal_record
     for s in sources:
         if s.get("kind") == "event" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
@@ -123,7 +113,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
                         [lid]
                     )
 
-    # 3. Signed Approval Notice -> send_approved_notice (Minimal 1 Line)
+    # 3. Signed Approval Notice -> send_approved_notice
     for s in sources:
         if s.get("kind") == "approval" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
@@ -158,7 +148,7 @@ def classify_bulletproof(dossier: dict) -> tuple:
                         [lid]
                     )
 
-    # 4. Identity Conflict -> request_confirmation (Minimal 1 Line)
+    # 4. Identity Conflict -> request_confirmation
     for s in sources:
         if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
             for line in s.get("lines", []):
@@ -167,17 +157,20 @@ def classify_bulletproof(dossier: dict) -> tuple:
                 if "does not match" in txt.lower() or "identity conflict" in txt.lower():
                     email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
                     case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt) or re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                    queue_m = re.search(r'requires ([a-zA-Z0-9_\-]+) confirmation', txt)
+                    
+                    target_queue = queue_m.group(1) if queue_m else mailbox
                     sender = email_m.group(1) if email_m else "unverified@supplier.example"
                     ref = case_m.group(1) if case_m else d_id
                     
                     return (
                         "request_confirmation",
-                        {"kind": "approval_queue", "id": owning_team},
+                        {"kind": "approval_queue", "id": target_queue},
                         {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref},
                         [lid]
                     )
 
-    # 5. Customer Inquiry -> create_draft (Minimal 1 Line)
+    # 5. Customer Inquiry -> create_draft
     for s in sources:
         if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
             for line in s.get("lines", []):
@@ -192,14 +185,25 @@ def classify_bulletproof(dossier: dict) -> tuple:
                                 sender_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', l2.get("text", ""))
                     rcpt = sender_m.group(1) if sender_m else "customer@example.com"
                     ref = ord_m.group(1) if ord_m else d_id
+                    
+                    pub_status = "processing"
+                    for s2 in sources:
+                        for l2 in s2.get("lines", []):
+                            t2 = l2.get("text", "")
+                            if "customer-visible status" in t2.lower() or "public status" in t2.lower():
+                                st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', t2.lower())
+                                if st_m:
+                                    pub_status = st_m.group(1)
+                                    break
+
                     return (
                         "create_draft",
                         {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
-                        {"recipient": rcpt, "referenceId": ref, "status": "processing", "template": "order_status"},
+                        {"recipient": rcpt, "referenceId": ref, "status": pub_status, "template": "order_status"},
                         [lid]
                     )
 
-    # 6. Fallback no_action (Minimal 1 Line)
+    # 6. Fallback no_action
     rec_line = []
     ref = d_id
     for s in sources:
