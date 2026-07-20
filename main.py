@@ -14,8 +14,8 @@ from typing import List, Dict, Any, Optional
 from collections import deque
 
 # Import Q8 - Q11 routers
-from q8 import router as q8_router, check_redteam, RedteamRequest
-from q9 import router as q9_router, load_q9_cache
+from q8 import router as q8_router
+from q9 import router as q9_router
 from q10 import router as q10_router
 from q11 import router as q11_router
 
