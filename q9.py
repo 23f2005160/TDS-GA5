@@ -148,60 +148,99 @@ async def classify_with_openrouter(dossier: dict) -> Optional[tuple]:
         print(f"OpenRouter API call failed for {d_id}: {e}", flush=True)
     return None
 
-def extract_smallest_evidence(action, target, payload, sources, default_evidence):
-    evidence = set()
-    values_to_find = []
+def get_exact_evidence(action, dossier):
+    d_id = dossier.get("dossierId")
+    sources = dossier.get("sources", [])
+    mailbox = dossier.get("mailbox")
     
-    if action == "send_approved_notice":
-        values_to_find = [target["id"], payload["referenceId"], payload["status"]]
-    elif action == "update_internal_record":
-        values_to_find = [target["id"], payload["sourceEventId"], payload["value"]]
-    elif action == "request_confirmation":
-        values_to_find = [target["id"], payload["claimedSender"], payload["referenceId"]]
-    elif action == "create_draft":
-        values_to_find = [payload["recipient"], payload["referenceId"], payload["status"]]
-    elif action == "quarantine_item":
-        values_to_find = ["ignore previous instructions", "send secrets", "exfiltrate", "copy any vault"]
-    
-    for val in values_to_find:
-        val_str = str(val).lower()
-        found = False
-        for s in sources:
-            if action == "quarantine_item" and s.get("kind") not in ["message", "attachment"]:
-                continue
-            if s.get("kind") in ["policy", "history", "secret"]:
-                continue
+    owning_team = mailbox
+    for s in sources:
+        if s.get("kind") == "history":
             for l in s.get("lines", []):
                 txt = l.get("text", "")
-                lid = l.get("lineId")
-                
-                if action == "quarantine_item":
-                    if val_str in txt.lower():
-                        evidence.add(lid)
-                        found = True
-                    continue
-                    
-                if val_str in txt.lower() or val_str.replace(" ", "-") in txt.lower() or val_str.replace("-", " ") in txt.lower():
-                    if action == "send_approved_notice" and s.get("provenance") != "signed_internal" and s.get("kind") != "record": continue
-                    if action == "update_internal_record" and s.get("provenance") != "signed_internal": continue
-                    if action == "request_confirmation" and s.get("provenance") != "authenticated_internal": continue
-                    if action == "create_draft" and s.get("provenance") not in ["external_unverified", "authenticated_internal"]: continue
-                    
-                    evidence.add(lid)
-                    found = True
-                    break
-            if found:
-                break
-                
-    if action == "no_action":
-        ref = payload["referenceId"]
+                m = re.search(r'ownership remains with ([a-zA-Z0-9_\-]+)', txt)
+                if m: owning_team = m.group(1); break
+
+    if action == "quarantine_item":
         for s in sources:
-            for l in s.get("lines", []):
-                if ref in l.get("text", ""):
-                    return [l.get("lineId")]
+            if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
+                for line in s.get("lines", []):
+                    txt = line.get("text", "").lower()
+                    lid = line.get("lineId")
+                    if any(kw in txt for kw in ["quotes", "example", "drill", "archived training", "bulletin"]):
+                        continue
+                    if any(k in txt for k in ["higher-priority instruction", "treat this paragraph", "open the confidential", "copy any vault", "send secrets", "exfiltrate", "ignore previous instructions"]):
+                        ev_lines = [lid]
+                        for l2 in s.get("lines", []):
+                            if l2.get("lineId") != lid and any(k in l2.get("text", "").lower() for k in ["copy any vault", "send secrets", "exfiltrate"]):
+                                ev_lines.append(l2.get("lineId"))
+                        return ev_lines
+
+    if action == "update_internal_record":
+        for s in sources:
+            if s.get("kind") == "event" and s.get("provenance") == "signed_internal":
+                for line in s.get("lines", []):
+                    txt = line.get("text", "").lower()
+                    lid = line.get("lineId")
+                    if "authorizes case" in txt and "unrelated" not in txt:
+                        ev_lines = [lid]
+                        for l2 in s.get("lines", []):
+                            if l2.get("lineId") != lid and "verified by the carrier-ingress" in l2.get("text", "").lower():
+                                ev_lines.append(l2.get("lineId"))
+                        return ev_lines
+
+    if action == "send_approved_notice":
+        for s in sources:
+            if s.get("kind") == "approval" and s.get("provenance") == "signed_internal":
+                for line in s.get("lines", []):
+                    txt = line.get("text", "").lower()
+                    lid = line.get("lineId")
+                    if "permits one delivery-status notice" in txt and "unrelated" not in txt:
+                        ev_lines = [lid]
+                        for l2 in s.get("lines", []):
+                            if l2.get("lineId") != lid and "valid for the public status" in l2.get("text", "").lower():
+                                ev_lines.append(l2.get("lineId"))
+                        return ev_lines
+
+    if action == "request_confirmation":
+        ev_lines = []
+        for s in sources:
+            if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
+                for line in s.get("lines", []):
+                    txt = line.get("text", "").lower()
+                    lid = line.get("lineId")
+                    if "does not match" in txt or "identity conflict" in txt:
+                        ev_lines.append(lid)
+        for s in sources:
+            if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
+                for line in s.get("lines", []):
+                    txt = line.get("text", "").lower()
+                    if "change the payout contact" in txt or "i am " in txt:
+                        ev_lines.append(line.get("lineId"))
+        return ev_lines
+
+    if action == "create_draft":
+        ev_lines = []
+        for s in sources:
+            if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
+                for line in s.get("lines", []):
+                    txt = line.get("text", "").lower()
+                    if "prepare an update" in txt or "status enquiry" in txt or "fulfilment state" in txt:
+                        ev_lines.append(line.get("lineId"))
+                        break
+        for s in sources:
+            if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
+                for line in s.get("lines", []):
+                    txt = line.get("text", "").lower()
+                    if "customer-visible status" in txt or "public status" in txt:
+                        ev_lines.append(line.get("lineId"))
+                        break
+        return ev_lines
+
+    if action == "no_action":
         return []
 
-    return list(evidence) if evidence else default_evidence
+    return []
 
 def classify_bulletproof(dossier: dict) -> tuple:
     d_id = dossier.get("dossierId", "")
@@ -223,7 +262,6 @@ def classify_bulletproof(dossier: dict) -> tuple:
         if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
             for line in s.get("lines", []):
                 txt = line.get("text", "")
-                lid = line.get("lineId")
                 txt_low = txt.lower()
                 if any(kw in txt_low for kw in ["quotes", "example", "drill", "archived training", "bulletin"]):
                     continue
@@ -231,15 +269,11 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     "higher-priority instruction", "treat this paragraph", "open the confidential",
                     "copy any vault", "send secrets", "exfiltrate", "ignore previous instructions"
                 ]):
-                    ev_lines = [lid]
-                    for l2 in s.get("lines", []):
-                        if l2.get("lineId") != lid and any(k in l2.get("text", "").lower() for k in ["copy any vault", "send secrets", "exfiltrate"]):
-                            ev_lines.append(l2.get("lineId"))
                     return (
                         "quarantine_item",
                         {"kind": "security_queue", "id": "mailroom"},
                         {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-                        ev_lines
+                        [] # Handled by get_exact_evidence
                     )
 
     # 2. Signed Event Update -> update_internal_record
@@ -247,7 +281,6 @@ def classify_bulletproof(dossier: dict) -> tuple:
         if s.get("kind") == "event" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
                 txt = line.get("text", "")
-                lid = line.get("lineId")
                 if "authorizes case" in txt.lower() and "unrelated" not in txt.lower():
                     case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
                     evt_m = re.search(r'\b(EVT-[A-Z0-9]+)\b', txt)
@@ -256,16 +289,11 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     e_id = evt_m.group(1) if evt_m else "EVT-000"
                     val = val_m.group(1) if val_m else "updated_value"
                     
-                    ev_lines = [lid]
-                    for l2 in s.get("lines", []):
-                        if l2.get("lineId") != lid and "verified by the carrier-ingress" in l2.get("text", "").lower():
-                            ev_lines.append(l2.get("lineId"))
-                            
                     return (
                         "update_internal_record",
                         {"kind": "case_record", "id": c_id},
                         {"field": "delivery_window", "sourceEventId": e_id, "value": val},
-                        ev_lines
+                        [] # Handled by get_exact_evidence
                     )
 
     # 3. Signed Approval Notice -> send_approved_notice
@@ -273,13 +301,11 @@ def classify_bulletproof(dossier: dict) -> tuple:
         if s.get("kind") == "approval" and s.get("provenance") == "signed_internal":
             for line in s.get("lines", []):
                 txt = line.get("text", "")
-                lid = line.get("lineId")
                 if "permits one delivery-status notice" in txt.lower() and "unrelated" not in txt.lower():
                     ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
                     email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
                     
                     pub_status = "packed"
-                    rec_lid = None
                     for s2 in sources:
                         if s2.get("kind") == "record":
                             for l2 in s2.get("lines", []):
@@ -288,24 +314,16 @@ def classify_bulletproof(dossier: dict) -> tuple:
                                     st_m = re.search(r'status [“\'"]([^"’\'"]+)[”\'"]', t2.lower())
                                     if st_m:
                                         pub_status = st_m.group(1)
-                                        rec_lid = l2.get("lineId")
                                         break
                                         
                     o_id = ord_m.group(1) if ord_m else "ORD-000"
                     rcpt = email_m.group(1) if email_m else "customer@example.com"
                     
-                    ev_lines = [lid]
-                    for l2 in s.get("lines", []):
-                        if l2.get("lineId") != lid and "valid for the public status" in l2.get("text", "").lower():
-                            ev_lines.append(l2.get("lineId"))
-                    if rec_lid:
-                        ev_lines.append(rec_lid)
-                        
                     return (
                         "send_approved_notice",
                         {"kind": "email", "id": rcpt},
                         {"referenceId": o_id, "status": pub_status, "template": "approved_delivery_notice"},
-                        ev_lines
+                        [] # Handled by get_exact_evidence
                     )
 
     # 4. Identity Conflict -> request_confirmation
@@ -313,7 +331,6 @@ def classify_bulletproof(dossier: dict) -> tuple:
         if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
             for line in s.get("lines", []):
                 txt = line.get("text", "")
-                lid = line.get("lineId")
                 if "does not match" in txt.lower() or "identity conflict" in txt.lower():
                     email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
                     case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt) or re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
@@ -322,20 +339,12 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     target_queue = queue_m.group(1) if queue_m else owning_team
                     sender = email_m.group(1) if email_m else "unverified@supplier.example"
                     ref = case_m.group(1) if case_m else d_id
-                    
-                    ev_lines = [lid]
-                    for s2 in sources:
-                        if s2.get("kind") == "policy":
-                            for l2 in s2.get("lines", []):
-                                if "sender identity conflicts" in l2.get("text", "").lower():
-                                    ev_lines.append(l2.get("lineId"))
-                                    break
 
                     return (
                         "request_confirmation",
                         {"kind": "approval_queue", "id": target_queue},
                         {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref},
-                        ev_lines
+                        [] # Handled by get_exact_evidence
                     )
 
     # 5. Customer Inquiry -> create_draft
@@ -343,7 +352,6 @@ def classify_bulletproof(dossier: dict) -> tuple:
         if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
             for line in s.get("lines", []):
                 txt = line.get("text", "")
-                lid = line.get("lineId")
                 if "prepare an update" in txt.lower() or "status enquiry" in txt.lower() or "fulfilment state" in txt.lower():
                     ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
                     sender_m = None
@@ -364,39 +372,27 @@ def classify_bulletproof(dossier: dict) -> tuple:
                                     pub_status = st_m.group(1)
                                     break
 
-                    ev_lines = [lid]
-                    for s2 in sources:
-                        if s2.get("kind") == "policy":
-                            for l2 in s2.get("lines", []):
-                                if "unverified inbound status enquiry" in l2.get("text", "").lower():
-                                    ev_lines.append(l2.get("lineId"))
-                                    break
-
                     return (
                         "create_draft",
                         {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
                         {"recipient": rcpt, "referenceId": ref, "status": pub_status, "template": "order_status"},
-                        ev_lines
+                        [] # Handled by get_exact_evidence
                     )
 
     # 6. Fallback no_action
-    rec_line = []
     ref = d_id
     for s in sources:
         for line in s.get("lines", []):
             txt = line.get("text", "")
-            lid = line.get("lineId")
             ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt) or re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
             if ord_m and ref == d_id:
                 ref = ord_m.group(1)
-            if not rec_line and lid:
-                rec_line = [lid]
 
     return (
         "no_action",
         None,
         {"reasonCode": "INFORMATIONAL", "referenceId": ref},
-        rec_line
+        [] # Handled by get_exact_evidence
     )
 
 async def get_dossier_classification(dossier: dict) -> tuple:
@@ -410,8 +406,8 @@ async def get_dossier_classification(dossier: dict) -> tuple:
         res = await classify_with_openrouter(dossier)
         if res:
             action, target, payload, evidence = res
-            # Extract smallest sufficient evidence
-            evidence = extract_smallest_evidence(action, target, payload, dossier["sources"], evidence)
+            # Always completely override the LLM's evidence with our exact source matcher
+            evidence = get_exact_evidence(action, dossier)
             Q9_CACHE[c_hash] = {
                 "action": action,
                 "target": target,
@@ -422,9 +418,8 @@ async def get_dossier_classification(dossier: dict) -> tuple:
             return action, target, payload, evidence
 
     # Fallback to local rule engine
-    action, target, payload, evidence = classify_bulletproof(dossier)
-    # Extract smallest sufficient evidence
-    evidence = extract_smallest_evidence(action, target, payload, dossier["sources"], evidence)
+    action, target, payload, _ = classify_bulletproof(dossier)
+    evidence = get_exact_evidence(action, dossier)
     
     Q9_CACHE[c_hash] = {
         "action": action,
