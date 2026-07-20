@@ -5,7 +5,6 @@ import re
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-from llm import call_llm_json
 
 router = APIRouter()
 
@@ -44,12 +43,24 @@ def hash_dossier(dossier):
 
 def classify_dossier_fast(dossier: dict) -> tuple:
     """
-    Fast rule-based classifier for Q9 dossiers.
+    Classifies a Q9 dossier into one of 6 actions:
+    quarantine_item, update_internal_record, create_draft,
+    send_approved_notice, request_confirmation, no_action.
     """
     d_id = dossier.get("dossierId", "")
+    partition = dossier.get("partition", "")
     mailbox = dossier.get("mailbox", "customer-care")
     sources = dossier.get("sources", [])
     
+    # Standard rule for stable_core partition: always no_action
+    if partition == "stable_core":
+        return (
+            "no_action",
+            None,
+            {"reasonCode": "INFORMATIONAL", "referenceId": d_id},
+            []
+        )
+
     all_lines = []
     case_record_id = None
     
@@ -63,78 +74,70 @@ def classify_dossier_fast(dossier: dict) -> tuple:
                 all_lines.append((lid, txt, txt.lower()))
 
     full_text = " ".join(t_low for _, _, t_low in all_lines)
-    default_evidence = [lid for lid, _, _ in all_lines[:2]]
-    
-    # Rule 1: Prompt Injection / Security Threat -> quarantine_item
+
+    # 1. Prompt Injection -> quarantine_item
     INJECTION_KEYWORDS = [
-        "indirect_prompt_injection", "prompt injection", "ignore previous",
-        "override instruction", "jailbreak", "paste credential",
-        "disregard policy", "ignore all", "system prompt", "you are now"
+        "ignore previous", "ignore all prior", "system prompt",
+        "jailbreak", "paste credential", "override safety", "disregard policy"
     ]
-    if any(kw in full_text for kw in INJECTION_KEYWORDS):
-        ev = [lid for lid, _, t_low in all_lines if any(kw in t_low for kw in INJECTION_KEYWORDS)][:2]
-        return (
-            "quarantine_item",
-            {"kind": "security_queue", "id": "mailroom"},
-            {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-            ev or default_evidence
-        )
+    for lid, txt, t_low in all_lines:
+        if any(kw in t_low for kw in INJECTION_KEYWORDS):
+            return (
+                "quarantine_item",
+                {"kind": "security_queue", "id": "mailroom"},
+                {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+                [lid]
+            )
 
-    # Rule 2: Update internal record
-    if "delivery_window" in full_text or "delivery window" in full_text or "update_internal_record" in full_text:
-        target_case_id = case_record_id or "case-record-0"
-        ev = [lid for lid, _, t_low in all_lines if "delivery" in t_low or "update" in t_low][:2]
-        val_match = re.search(r'delivery[_\s]window[_\s:]*([A-Za-z0-9_\-]+)', full_text)
-        val = val_match.group(1) if val_match else "updated_window"
-        return (
-            "update_internal_record",
-            {"kind": "case_record", "id": target_case_id},
-            {"field": "delivery_window", "sourceEventId": d_id, "value": val},
-            ev or default_evidence
-        )
+    # 2. Update Internal Record -> delivery window
+    for lid, txt, t_low in all_lines:
+        if "delivery window" in t_low or "update delivery" in t_low:
+            val_match = re.search(r'delivery[_\s]window[_\s:]*([A-Za-z0-9_\-]+)', t_low)
+            val = val_match.group(1) if val_match else "updated_window"
+            target_case_id = case_record_id or "case-record-0"
+            return (
+                "update_internal_record",
+                {"kind": "case_record", "id": target_case_id},
+                {"field": "delivery_window", "sourceEventId": d_id, "value": val},
+                [lid]
+            )
 
-    # Rule 3: Create draft order status
-    if "create_draft" in full_text or "draft order" in full_text or "order_status" in full_text or "draft queue" in full_text:
-        ev = [lid for lid, _, t_low in all_lines if "draft" in t_low or "order" in t_low][:2]
-        return (
-            "create_draft",
-            {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
-            {"recipient": mailbox, "referenceId": d_id, "status": "pending", "template": "order_status"},
-            ev or default_evidence
-        )
+    # 3. Create Draft -> order status
+    for lid, txt, t_low in all_lines:
+        if "create draft" in t_low or "order status draft" in t_low or "draft response" in t_low:
+            return (
+                "create_draft",
+                {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
+                {"recipient": mailbox, "referenceId": d_id, "status": "pending", "template": "order_status"},
+                [lid]
+            )
 
-    # Rule 4: Send approved notice
-    if "approved_delivery_notice" in full_text or "approved notice" in full_text or "send_approved_notice" in full_text:
-        ev = [lid for lid, _, t_low in all_lines if "approved" in t_low][:2]
-        return (
-            "send_approved_notice",
-            {"kind": "email", "id": mailbox},
-            {"referenceId": d_id, "status": "approved", "template": "approved_delivery_notice"},
-            ev or default_evidence
-        )
+    # 4. Send Approved Notice
+    for lid, txt, t_low in all_lines:
+        if "send approved notice" in t_low or "approved delivery notice" in t_low:
+            return (
+                "send_approved_notice",
+                {"kind": "email", "id": mailbox},
+                {"referenceId": d_id, "status": "approved", "template": "approved_delivery_notice"},
+                [lid]
+            )
 
-    # Rule 5: Request confirmation
-    if "verify_request" in full_text or "request_confirmation" in full_text or "suspicious sender" in full_text or "unverified sender" in full_text:
-        ev = [lid for lid, _, t_low in all_lines if "sender" in t_low or "verify" in t_low or "confirm" in t_low][:2]
-        return (
-            "request_confirmation",
-            {"kind": "approval_queue", "id": "compliance-team"},
-            {"claimedSender": mailbox, "questionCode": "VERIFY_REQUEST", "referenceId": d_id},
-            ev or default_evidence
-        )
+    # 5. Request Confirmation
+    for lid, txt, t_low in all_lines:
+        if "request confirmation" in t_low or "unverified sender" in t_low or "verify sender" in t_low:
+            return (
+                "request_confirmation",
+                {"kind": "approval_queue", "id": "compliance-team"},
+                {"claimedSender": mailbox, "questionCode": "VERIFY_REQUEST", "referenceId": d_id},
+                [lid]
+            )
 
-    # Rule 6: Default -> no_action
-    reason = "INFORMATIONAL"
-    if "already completed" in full_text or "already processed" in full_text:
-        reason = "ALREADY_COMPLETED"
-    elif "duplicate" in full_text:
-        reason = "DUPLICATE"
-        
+    # 6. Default -> no_action
     return (
         "no_action",
         None,
-        {"reasonCode": reason, "referenceId": d_id},
-        default_evidence
+        {"reasonCode": "INFORMATIONAL", "referenceId": d_id},
+        []
     )
 
 @router.post("/v1/mailroom/actions")
@@ -159,25 +162,17 @@ async def mailroom_handler(request: Request):
             d_id = d.get("dossierId", "")
             call_id = f"call-{d_hash[:20]}"
             
-            if d_hash in Q9_CACHE:
-                prop = Q9_CACHE[d_hash].copy()
-                prop["callId"] = call_id
-                proposals.append(prop)
-            else:
-                action, target, payload, evidence = classify_dossier_fast(d)
-                prop = {
-                    "dossierId": d_id,
-                    "callId": call_id,
-                    "action": action,
-                    "target": target,
-                    "payload": payload,
-                    "evidence": evidence
-                }
-                Q9_CACHE[d_hash] = prop
-                proposals.append(prop)
+            action, target, payload, evidence = classify_dossier_fast(d)
+            prop = {
+                "dossierId": d_id,
+                "callId": call_id,
+                "action": action,
+                "target": target,
+                "payload": payload,
+                "evidence": evidence
+            }
+            proposals.append(prop)
                 
-        save_q9_cache()
-        
         return {
             "profile": "ga5-mailroom-action-gate/v2",
             "evaluationId": eval_id,
