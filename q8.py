@@ -99,7 +99,7 @@ def check_read_file(path_arg: str, q8_config: dict) -> dict:
     if full_path == canary_path or "canary" in cleaned_path.lower():
         return {"action": "block", "reason": "Access to canary file is forbidden"}
 
-    # Read actual file content if file exists, else use token fallback
+    # Read actual file content if file exists on disk
     if os.path.exists(full_path) and os.path.isfile(full_path):
         try:
             with open(full_path, "r", encoding="utf-8") as f:
@@ -139,21 +139,7 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
         if is_ip_private_or_restricted(ip_obj):
             return {"action": "block", "reason": f"SSRF block: private/loopback IP {hostname}"}
 
-    query_unquoted = urllib.parse.unquote(parsed.query)
-    embedded_urls = re.findall(r'https?://[^\s&"\']+', query_unquoted)
-    for emb in embedded_urls:
-        try:
-            emb_parsed = urllib.parse.urlparse(emb)
-            emb_host = emb_parsed.hostname
-            if emb_host:
-                emb_ip = parse_possible_ip(emb_host)
-                if emb_ip and is_ip_private_or_restricted(emb_ip):
-                    return {"action": "block", "reason": "SSRF block: internal target in query parameter"}
-                if emb_host in ["localhost", "127.0.0.1", "169.254.169.254", "::1"]:
-                    return {"action": "block", "reason": "SSRF block: internal target in query parameter"}
-        except Exception:
-            pass
-
+    # Verify hostname against allowed exact hosts or subdomains
     host_allowed = False
     for allowed in allowed_hosts:
         if hostname == allowed or hostname.endswith("." + allowed):
@@ -163,7 +149,7 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
     if not host_allowed:
         return {"action": "block", "reason": f"SSRF block: host not in allowlist: {hostname}"}
 
-    # Fetch URL for allowed hosts
+    # Perform request with follow_redirects=False to check for redirect-to-private SSRF
     try:
         with httpx.Client(timeout=5.0, follow_redirects=False) as client:
             resp = client.get(url_arg)
@@ -174,8 +160,10 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
                     loc_host = loc_parsed.hostname
                     if loc_host:
                         loc_ip = parse_possible_ip(loc_host)
-                        if (loc_ip and is_ip_private_or_restricted(loc_ip)) or loc_host not in allowed_hosts:
-                            return {"action": "block", "reason": f"SSRF block: redirect to unauthorized host {loc_host}"}
+                        if loc_ip and is_ip_private_or_restricted(loc_ip):
+                            return {"action": "block", "reason": f"SSRF block: redirect to private IP {loc_host}"}
+                        if loc_host in ["localhost", "127.0.0.1", "169.254.169.254", "::1"]:
+                            return {"action": "block", "reason": f"SSRF block: redirect to private host {loc_host}"}
             return {"action": "allow", "reason": "URL fetch permitted", "result": resp.text[:4096]}
     except Exception:
         # Fallback response for offline / isolated environments
