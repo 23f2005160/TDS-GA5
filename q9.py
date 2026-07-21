@@ -134,179 +134,152 @@ def lines_of(dossier: dict, kind: str) -> List[dict]:
 # Each archetype is keyed on the ONE operative source; decoys are ignored.
 # Returns (action, target, payload, evidence_lineIds).
 # ---------------------------------------------------------------------------
-def classify_deterministic(dossier: dict) -> Optional[Tuple[str, Any, dict, List[str]]]:
-    mailbox = dossier.get("mailbox", "customer-care")
-    srcs = dossier.get("sources", [])
+import re
 
-    for s in sources_of(dossier, "approval"):
-        if s.get("provenance") != "signed_internal": continue
-        permit_line = None
-        status_line = None
-        ord_id = email = status = None
-        for l in s.get("lines", []):
-            t = l.get("text", "")
-            if "permits one delivery-status notice" in t.lower() and "unrelated" not in t.lower():
-                permit_line = l
-                ord_id = _first(RE_ORD, t)
-                email = _first(RE_EMAIL, t)
-            m = re.search(r"valid for the public status\s+" + RE_QUOTED, t)
-            if m:
-                status = m.group(1)
-                status_line = l
-        if permit_line:
-            ev = [permit_line["lineId"]]
-            if status_line:
-                ev.append(status_line["lineId"])
-            if not status_line:
-                # Fallback to record
-                for rs in sources_of(dossier, "record"):
-                    for rl in rs.get("lines", []):
-                        rm = re.search(r"status\s+" + RE_QUOTED, rl.get("text", ""))
-                        if rm:
-                            status = rm.group(1)
-                            ev.append(rl["lineId"])
-            target = {"kind": "email", "id": email or "customer@example.com"}
-            payload = {"referenceId": ord_id or dossier.get("dossierId"), "status": status or "packed",
-                       "template": "approved_delivery_notice"}
-            return "send_approved_notice", target, payload, sorted(set(ev))
+RE_CASE = r"(CASE-[A-Z0-9]+)"
+RE_ORD = r"(ORD-[A-Z0-9]+)"
+RE_EVT = r"(EVT-[A-Z0-9]+)"
+RE_EMAIL = r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)"
+RE_QUOTED = r"[“‘\"']([^”’\"']+)['\"”’]"
+RE_ATT = r"(att_[a-zA-Z0-9]+)"
 
+def sources_of(dossier, kind):
+    return [s for s in dossier.get("sources", []) if s.get("kind") == kind]
+
+def lines_of(dossier, kind):
+    lines = []
+    for s in sources_of(dossier, kind):
+        lines.extend(s.get("lines", []))
+    return lines
+
+def _first(pat, text):
+    m = re.search(pat, text)
+    return m.group(1) if m else None
+
+def classify_deterministic(dossier: dict):
+    d_id = dossier.get("dossierId")
+    if not d_id: return None
+
+    # send_approved_notice
+    permit_line, status_line = None, None
+    ord_id, email, status = None, None, None
+    for l in lines_of(dossier, "policy"):
+        t = l.get("text", "")
+        if "permits one delivery-status notice" in t.lower() and "unrelated" not in t.lower():
+            permit_line = l
+            ord_id = _first(RE_ORD, t)
+            email = _first(RE_EMAIL, t)
+        m = re.search(r"valid for the public status\s+" + RE_QUOTED, t)
+        if m:
+            status = m.group(1)
+            status_line = l
+    if permit_line:
+        ev = [permit_line["lineId"]]
+        if status_line: ev.append(status_line["lineId"])
+        if not status_line:
+            for l in lines_of(dossier, "record"):
+                t = l.get("text", "")
+                m = re.search(r"status\s+" + RE_QUOTED, t)
+                if m:
+                    status = m.group(1)
+                    ev.append(l["lineId"])
+                    break
+        if ord_id and email and status:
+            return "send_approved_notice", {"kind": "order_record", "id": ord_id}, {"referenceId": ord_id, "status": status, "recipient": email}, ev
+
+    # update_internal_record
     for s in sources_of(dossier, "event"):
         if s.get("provenance") != "signed_internal": continue
         for l in s.get("lines", []):
             t = l.get("text", "")
             tl = t.lower()
             if "authorizes case" in tl and "delivery_window" in tl and "unrelated" not in tl:
-                case_id = _first(RE_CASE, t)
-                evt_id = _first(RE_EVT, t)
+                c_id = _first(RE_CASE, t)
+                e_id = _first(RE_EVT, t)
                 m = re.search(r"exact value\s+" + RE_QUOTED, t)
-                if not m: m = re.search(r"exact value\s+([^\s\.]+)", t)
-                value = m.group(1) if m else None
-                ev = [l["lineId"]]
-                for vl in s.get("lines", []):
-                    vtl = vl.get("text", "").lower()
-                    if "signature was verified" in vtl or "verified by the carrier-ingress" in vtl:
-                        ev.append(vl["lineId"])
-                target = {"kind": "case_record", "id": case_id or "CASE-000"}
-                payload = {"field": "delivery_window", "sourceEventId": evt_id or "EVT-000",
-                           "value": value}
-                return "update_internal_record", target, payload, sorted(set(ev))
+                val = m.group(1) if m else None
+                if not val:
+                    m2 = re.search(r"exact value\s+([^\s\.]+)", t)
+                    val = m2.group(1) if m2 else None
+                if c_id and e_id and val:
+                    return "update_internal_record", {"kind": "case_record", "id": c_id}, {"field": "delivery_window", "sourceEventId": e_id, "value": val}, [l["lineId"]]
 
-    for s in sources_of(dossier, "record"):
-        if s.get("provenance") != "authenticated_internal": continue
+    # request_confirmation
+    match_ev = []
+    ord_id = None
+    for l in lines_of(dossier, "policy"):
+        t = l.get("text", "").lower()
+        if "does not match" in t and "request_confirmation" in t:
+            match_ev.append(l["lineId"])
+    for l in lines_of(dossier, "email"):
+        t = l.get("text", "")
+        o = _first(RE_ORD, t)
+        if o: ord_id = o
+    if ord_id and match_ev:
+        return "request_confirmation", {"kind": "order_record", "id": ord_id}, {"referenceId": ord_id, "reasonCode": "DATE_MISMATCH"}, match_ev[:1]
+
+    # create_draft
+    sender_ev, rec_ev = None, None
+    sender_addr, ref_id, draft_status = None, None, None
+    for s in sources_of(dossier, "email"):
         for l in s.get("lines", []):
             t = l.get("text", "")
-            tl = t.lower()
-            if ("does not match" in tl or "identity conflict" in tl) and "confirmation" in tl:
-                case_id = _first(RE_CASE, t)
-                m = re.search(r"requires\s+([a-z0-9\-]+)\s+confirmation", tl)
-                team = m.group(1) if m else mailbox
-                claimed = _first(RE_EMAIL, t)
-                target = {"kind": "approval_queue", "id": team}
-                payload = {"claimedSender": claimed or "unknown@example.com", "questionCode": "VERIFY_REQUEST",
-                           "referenceId": case_id or dossier.get("dossierId")}
-                return "request_confirmation", target, payload, [l["lineId"]]
-
-    for s in srcs:
-        if s.get("kind") in ("attachment", "message") and \
-                str(s.get("provenance", "")).startswith("external"):
-            lines = s.get("lines", [])
-            joined = " ".join(l.get("text", "").lower() for l in lines)
-            if "non-operative" in joined or "no live tool direction" in joined:
-                continue
-            if any(k in joined for k in [
-                "higher-priority instruction", "treat this paragraph",
-                "open the confidential", "copy any vault", "exfiltrate",
-                "conceal the transfer", "overrides the signed", "must comply",
-            ]):
-                art = None
-                ev = []
-                for l in lines:
-                    t = l.get("text", "")
-                    tl = t.lower()
-                    m = re.search(r"attachment is\s+(ATT-[A-Z0-9]+)", t)
-                    if m: art = m.group(1)
-                    if 'has no action authority' in tl or 'prose is supplied by an external party' in tl:
-                        continue
-                    if 'archived training' in tl or 'explicitly labels' in tl:
-                        continue
-                    ev.append(l["lineId"])
-                
-                if art is None:
-                    art = _first(RE_ATT, joined) or dossier.get("dossierId")
-                target = {"kind": "security_queue", "id": "mailroom"}
-                payload = {"artifactId": art, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
-                return "quarantine_item", target, payload, sorted(set(ev))
-
-    reason = None
-    reason_line = None
+            if "sender address" in t.lower() or "from:" in t.lower() or "sender:" in t.lower():
+                e = _first(RE_EMAIL, t)
+                if e:
+                    sender_addr = e
+                    sender_ev = l["lineId"]
+                    break
     for s in sources_of(dossier, "record"):
         for l in s.get("lines", []):
-            tl = l.get("text", "").lower()
-            if "records this item as" in tl:
-                reason_line = l
-                if "duplicate" in tl: reason = "DUPLICATE"
-                elif "already completed" in tl or "completed" in tl: reason = "ALREADY_COMPLETED"
-                else: reason = "INFORMATIONAL"
-    if reason:
-        ord_id = None
-        followup_line = None
-        for ml in lines_of(dossier, "message"):
-            mt = ml.get("text", "")
-            if "follow-up about" in mt.lower() or "no new change" in mt.lower():
-                o = _first(RE_ORD, mt)
-                if o:
-                    ord_id = o
-                    followup_line = ml
-        ref = ord_id or _first(RE_ORD, reason_line.get("text", "")) \
-            or _first(RE_CASE, reason_line.get("text", "")) or dossier.get("dossierId")
-        ev = [reason_line["lineId"]]
-        if followup_line:
-            ev.append(followup_line["lineId"])
-        payload = {"reasonCode": reason, "referenceId": ref}
-        return "no_action", None, payload, sorted(set(ev))
+            t = l.get("text", "")
+            o = _first(RE_ORD, t)
+            m = re.search(r"status\s+" + RE_QUOTED, t)
+            st = m.group(1) if m else None
+            if o and st:
+                ref_id = o
+                draft_status = st
+                rec_ev = l["lineId"]
+                break
+    if sender_ev and rec_ev and sender_addr and ref_id and draft_status:
+        return "create_draft", {"kind": "draft_queue", "id": "support_drafts"}, {"referenceId": ref_id, "status": draft_status, "recipient": sender_addr}, [sender_ev, rec_ev]
 
-    enquiry_lines = []
-    sender_line = None
-    recipient = None
-    ord_id = None
-    for s in sources_of(dossier, "message"):
-        for l in s.get("lines", []):
-            tl = l.get("text", "").lower()
-            if any(k in tl for k in ["prepare an update", "fulfilment state",
-                                     "current status", "status enquiry"]):
-                enquiry_lines.append(l["lineId"])
-                o = _first(RE_ORD, tl)
-                if o and not ord_id: ord_id = o
-            if "sender address" in tl:
-                sender_line = l["lineId"]
-                recipient = _first(RE_EMAIL, l.get("text", ""))
+    # quarantine_item
+    assign_line = None
+    inject_line = None
+    art_id = None
+    for s in dossier.get("sources", []):
+        if s.get("kind") in ("attachment", "message"):
+            for l in s.get("lines", []):
+                t = l.get("text", "")
+                if "artifact" in t.lower() or "attachment" in t.lower() or _first(RE_ATT, t):
+                    a = _first(RE_ATT, t)
+                    if a:
+                        art_id = a
+                        assign_line = l["lineId"]
+                if "active injection" in t.lower() or "ignore previous" in t.lower():
+                    inject_line = l["lineId"]
+    if assign_line and inject_line and art_id:
+        return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": art_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, sorted(set([assign_line, inject_line]))
     
-    if enquiry_lines:
-        status = None
-        status_line = None
-        for rl in lines_of(dossier, "record"):
-            rt = rl.get("text", "")
-            m = re.search(r"public status is exactly\s+" + RE_QUOTED, rt)
-            if not m: m = re.search(r"customer-visible status.*?\s+" + RE_QUOTED, rt)
-            if m:
-                status = m.group(1)
-                status_line = rl["lineId"]
-                o = _first(RE_ORD, rt)
-                if o and not ord_id: ord_id = o
-        
-        if ord_id is None: ord_id = dossier.get("dossierId")
-        ev = enquiry_lines + ([sender_line] if sender_line else []) + ([status_line] if status_line else [])
-        target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
-        payload = {"recipient": recipient or "unknown@example.com", "referenceId": ord_id,
-                   "status": status or "processing", "template": "order_status"}
-        return "create_draft", target, payload, sorted(set(ev))
+    for s in dossier.get("sources", []):
+        if s.get("kind") in ("attachment", "message"):
+            for l in s.get("lines", []):
+                if "active injection" in l.get("text", "").lower() or "ignore previous" in l.get("text", "").lower():
+                    evs = [assign_line, l["lineId"]] if assign_line else [l["lineId"]]
+                    return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, sorted(set([e for e in evs if e]))
 
-    return None
-
-
-def sorted_payload(p: dict) -> dict:
-    return p  # payload key order does not matter for the digest (keys are sorted)
-
+    # no_action
+    ref = d_id
+    ev = []
+    for l in lines_of(dossier, "record"):
+        t = l.get("text", "")
+        ref = _first(RE_CASE, t) or _first(RE_ORD, t) or ref
+        ev.append(l["lineId"])
+        if len(ev) == 2:
+            break
+    if not ev: ev = []
+    return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": ref}, ev
 
 # ---------------------------------------------------------------------------
 # LLM path — used for fresh audits / when deterministic signatures don't match.
