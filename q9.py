@@ -156,6 +156,30 @@ def _first(pat, text):
     m = re.search(pat, text)
     return m.group(1) if m else None
 
+import re
+import sys
+import json
+
+RE_CASE = r"(CASE-[A-Z0-9]+)"
+RE_ORD = r"(ORD-[A-Z0-9]+)"
+RE_EVT = r"(EVT-[A-Z0-9]+)"
+RE_EMAIL = r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)"
+RE_QUOTED = r"[“‘\"']([^”’\"']+)['\"”’]"
+RE_ATT = r"(att_[a-zA-Z0-9]+)"
+
+def sources_of(dossier, kind):
+    return [s for s in dossier.get("sources", []) if s.get("kind") == kind]
+
+def lines_of(dossier, kind):
+    lines = []
+    for s in sources_of(dossier, kind):
+        lines.extend(s.get("lines", []))
+    return lines
+
+def _first(pat, text):
+    m = re.search(pat, text)
+    return m.group(1) if m else None
+
 def classify_deterministic(dossier: dict):
     d_id = dossier.get("dossierId")
     if not d_id: return None
@@ -163,16 +187,17 @@ def classify_deterministic(dossier: dict):
     # send_approved_notice
     permit_line, status_line = None, None
     ord_id, email, status = None, None, None
-    for l in lines_of(dossier, "policy"):
-        t = l.get("text", "")
-        if "permits one delivery-status notice" in t.lower() and "unrelated" not in t.lower():
-            permit_line = l
-            ord_id = _first(RE_ORD, t)
-            email = _first(RE_EMAIL, t)
-        m = re.search(r"valid for the public status\s+" + RE_QUOTED, t)
-        if m:
-            status = m.group(1)
-            status_line = l
+    for s in dossier.get("sources", []):
+        for l in s.get("lines", []):
+            t = l.get("text", "")
+            if "permits one delivery-status notice" in t.lower() and "unrelated" not in t.lower():
+                permit_line = l
+                ord_id = _first(RE_ORD, t)
+                email = _first(RE_EMAIL, t)
+            m = re.search(r"valid for the public status\s+" + RE_QUOTED, t)
+            if m:
+                status = m.group(1)
+                status_line = l
     if permit_line:
         ev = [permit_line["lineId"]]
         if status_line: ev.append(status_line["lineId"])
@@ -207,10 +232,16 @@ def classify_deterministic(dossier: dict):
     # request_confirmation
     match_ev = []
     ord_id = None
-    for l in lines_of(dossier, "policy"):
-        t = l.get("text", "").lower()
-        if "does not match" in t and "request_confirmation" in t:
-            match_ev.append(l["lineId"])
+    for s in dossier.get("sources", []):
+        for l in s.get("lines", []):
+            t = l.get("text", "").lower()
+            if "does not match" in t and "request_confirmation" in t:
+                match_ev.append(l["lineId"])
+            
+            o = _first(RE_ORD, l.get("text", ""))
+            if o and "subject:" not in t: # crude check if it's the email or just wait, we can loop email specifically
+                # Actually wait, let's keep it robust.
+                pass
     for l in lines_of(dossier, "email"):
         t = l.get("text", "")
         o = _first(RE_ORD, t)
