@@ -251,13 +251,13 @@ def build_shapes_for_action(action: str, dossier: dict) -> Tuple[Any, dict, List
                         pub_status = 'awaiting customs release'
                         for l2 in s.get('lines', []):
                             if 'valid for the public status' in l2.get('text', '').lower():
-                                m = re.search(r'status [\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l2.get('text', ''))
+                                m = re.search(r'status.*[\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l2.get('text', ''))
                                 if m: pub_status = m.group(1)
                         if pub_status == 'awaiting customs release':
                             for s2 in sources:
                                 if s2.get('kind') == 'record':
                                     for l2 in s2.get('lines', []):
-                                        m = re.search(r'status [\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l2.get('text', ''))
+                                        m = re.search(r'status.*[\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l2.get('text', ''))
                                         if m: pub_status = m.group(1)
                         return {'kind': 'email', 'id': email_m.group(1) if email_m else 'customer@example.com'}, {'referenceId': ord_m.group(1) if ord_m else 'ORD-000', 'status': pub_status, 'template': 'approved_delivery_notice'}, evidence
 
@@ -305,7 +305,7 @@ def build_shapes_for_action(action: str, dossier: dict) -> Tuple[Any, dict, List
         for s in sources:
             if s.get('kind') == 'record' and s.get('provenance') == 'authenticated_internal':
                 for l in s.get('lines', []):
-                    m = re.search(r'status [\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l.get('text', ''))
+                    m = re.search(r'status.*[\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l.get('text', ''))
                     if m: pub_status = m.group(1)
         return {'kind': 'draft_queue', 'id': f'mailbox:{owning_team}'}, {'recipient': rcpt or 'customer@example.com', 'referenceId': ref or d_id, 'status': pub_status or 'processing', 'template': 'order_status'}, evidence
 
