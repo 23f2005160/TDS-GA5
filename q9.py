@@ -119,131 +119,158 @@ async def llm_choose_action(dossier: dict) -> Optional[str]:
 
 
 def build_shapes_for_action(action: str, dossier: dict) -> Tuple[Any, dict, List[str]]:
-    d_id = dossier.get("dossierId")
+    sources = dossier.get('sources', [])
+    d_id = dossier.get('dossierId', '')
+    mailbox = dossier.get('mailbox', 'customer-care')
+    
+    owning_team = mailbox
+    for s in sources:
+        if s.get('kind') == 'history':
+            for l in s.get('lines', []):
+                m = re.search(r'ownership remains with ([a-zA-Z0-9\-]+)', l.get('text', ''))
+                if m: owning_team = m.group(1)
 
-    if action == "send_approved_notice":
-        permit_line, status_line = None, None
-        ord_id, email, status = None, None, None
-        for s in dossier.get("sources", []):
-            for l in s.get("lines", []):
-                t = l.get("text", "")
-                if "permits one delivery-status notice" in t.lower() or "template approved_delivery_notice" in t.lower():
-                    permit_line = l
-                    ord_id = _first(RE_ORD, t)
-                    email = _first(RE_EMAIL, t)
-                m = re.search(r"public status\s+" + RE_QUOTED, t)
-                if m:
-                    status = m.group(1)
-                    status_line = l
+    # Evidence extraction
+    evidence = []
+    if action == 'update_internal_record':
+        for s in sources:
+            if s.get('kind') == 'event' and s.get('provenance') == 'signed_internal':
+                for l in s.get('lines', []):
+                    if 'authorizes case' in l.get('text', '').lower() and 'unrelated' not in l.get('text', '').lower():
+                        evidence = [l['lineId']]
+                        break
+    elif action == 'send_approved_notice':
         ev = []
-        if permit_line: ev.append(permit_line["lineId"])
-        if status_line: ev.append(status_line["lineId"])
-        if not status_line:
-            for s in dossier.get("sources", []):
-                if s.get("kind") == "record":
-                    for l in s.get("lines", []):
-                        t = l.get("text", "")
-                        m = re.search(r"status\s+" + RE_QUOTED, t)
-                        if m:
-                            status = m.group(1)
-                            ev.append(l["lineId"])
-                            break
-        return {"kind": "order_record", "id": ord_id}, {"referenceId": ord_id, "status": status, "recipient": email}, ev[:2]
-
-    elif action == "update_internal_record":
-        c_id, e_id, val = None, None, None
+        for s in sources:
+            if s.get('kind') == 'approval' and s.get('provenance') == 'signed_internal':
+                for l in s.get('lines', []):
+                    txt = l.get('text', '').lower()
+                    if 'permits one delivery-status notice' in txt and 'unrelated' not in txt:
+                        ev.append(l['lineId'])
+                    elif 'valid for the public status' in txt:
+                        ev.append(l['lineId'])
+        evidence = sorted(ev)
+    elif action == 'quarantine_item':
+        for s in sources:
+            if s.get('kind') in ['attachment', 'message'] and s.get('provenance') == 'external_untrusted':
+                ev = []
+                for l in s.get('lines', []):
+                    txt = l.get('text', '').lower()
+                    if 'has no action authority' in txt or 'prose is supplied by an external party' in txt:
+                        continue
+                    if 'archived training' in txt or 'quotes' in txt or 'explicitly labels the quotation non-operative' in txt:
+                        continue
+                    ev.append(l['lineId'])
+                evidence = sorted(ev)
+    elif action == 'request_confirmation':
+        for s in sources:
+            if s.get('kind') == 'record' and s.get('provenance') == 'authenticated_internal':
+                for l in s.get('lines', []):
+                    txt = l.get('text', '').lower()
+                    if 'does not match' in txt or 'identity conflict' in txt:
+                        evidence = [l['lineId']]
+                        break
+    elif action == 'create_draft':
         ev = []
-        for s in dossier.get("sources", []):
-            for l in s.get("lines", []):
-                t = l.get("text", "")
-                tl = t.lower()
-                if "authorizes case" in tl and "delivery_window" in tl and "unrelated" not in tl:
-                    c_id = _first(RE_CASE, t)
-                    e_id = _first(RE_EVT, t)
-                    m = re.search(r"exact value\s+" + RE_QUOTED, t)
-                    val = m.group(1) if m else _first(r"exact value\s+([^\s\.]+)", t)
-                    ev.append(l["lineId"])
-        return {"kind": "case_record", "id": c_id}, {"field": "delivery_window", "sourceEventId": e_id, "value": val}, ev[:1]
+        for s in sources:
+            if s.get('kind') == 'message' and s.get('provenance') == 'external_unverified':
+                for l in s.get('lines', []):
+                    txt = l.get('text', '').lower()
+                    if 'prepare an update' in txt or 'fulfilment state' in txt or 'status enquiry' in txt:
+                        ev.append(l['lineId'])
+                    elif 'sender address' in txt:
+                        ev.append(l['lineId'])
+        for s in sources:
+            if s.get('kind') == 'record' and s.get('provenance') == 'authenticated_internal':
+                for l in s.get('lines', []):
+                    if 'customer-visible status' in l.get('text', '').lower():
+                        ev.append(l['lineId'])
+        evidence = sorted(ev)
+        
+    # Target and payload extraction
+    if action == 'update_internal_record':
+        for s in sources:
+            if s.get('kind') == 'event' and s.get('provenance') == 'signed_internal':
+                for l in s.get('lines', []):
+                    txt = l.get('text', '')
+                    if 'authorizes case' in txt.lower() and 'unrelated' not in txt.lower():
+                        case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
+                        evt_m = re.search(r'\b(EVT-[A-Z0-9]+)\b', txt)
+                        val_m = re.search(r'exact value [\u201c"\'"]([^"\u201d\'"]+)[\u201d"\'"]', txt)
+                        if not val_m: val_m = re.search(r'exact value ([^\s\.]+)', txt)
+                        return {'kind': 'case_record', 'id': case_m.group(1) if case_m else 'CASE-000'}, {'field': 'delivery_window', 'sourceEventId': evt_m.group(1) if evt_m else 'EVT-000', 'value': val_m.group(1) if val_m else 'updated'}, evidence
 
-    elif action == "request_confirmation":
-        match_ev = []
-        ord_id = None
-        for s in dossier.get("sources", []):
-            for l in s.get("lines", []):
-                t = l.get("text", "").lower()
-                if "does not match" in t and "request_confirmation" in t:
-                    match_ev.append(l["lineId"])
-                o = _first(RE_ORD, l.get("text", ""))
-                if o and "subject:" not in t: ord_id = o
-        if not ord_id:
-            for s in dossier.get("sources", []):
-                if s.get("kind") == "email":
-                    for l in s.get("lines", []):
-                        o = _first(RE_ORD, l.get("text", ""))
-                        if o: ord_id = o
-        return {"kind": "order_record", "id": ord_id}, {"referenceId": ord_id, "reasonCode": "DATE_MISMATCH"}, match_ev[:1]
+    elif action == 'send_approved_notice':
+        for s in sources:
+            if s.get('kind') == 'approval' and s.get('provenance') == 'signed_internal':
+                for l in s.get('lines', []):
+                    txt = l.get('text', '')
+                    if 'permits one delivery-status notice' in txt.lower() and 'unrelated' not in txt.lower():
+                        ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                        email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
+                        pub_status = 'awaiting customs release'
+                        for l2 in s.get('lines', []):
+                            if 'valid for the public status' in l2.get('text', '').lower():
+                                m = re.search(r'status [\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l2.get('text', ''))
+                                if m: pub_status = m.group(1)
+                        if pub_status == 'awaiting customs release':
+                            for s2 in sources:
+                                if s2.get('kind') == 'record':
+                                    for l2 in s2.get('lines', []):
+                                        m = re.search(r'status [\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l2.get('text', ''))
+                                        if m: pub_status = m.group(1)
+                        return {'kind': 'email', 'id': email_m.group(1) if email_m else 'customer@example.com'}, {'referenceId': ord_m.group(1) if ord_m else 'ORD-000', 'status': pub_status, 'template': 'approved_delivery_notice'}, evidence
 
-    elif action == "create_draft":
-        sender_ev, rec_ev = None, None
-        sender_addr, ref_id, draft_status = None, None, None
-        for s in dossier.get("sources", []):
-            for l in s.get("lines", []):
-                t = l.get("text", "")
-                tl = t.lower()
-                if "sender address" in tl or "from:" in tl or "sender:" in tl:
-                    e = _first(RE_EMAIL, t)
-                    if e:
-                        sender_addr = e
-                        sender_ev = l["lineId"]
-                o = _first(RE_ORD, t)
-                m = re.search(r"status\s+" + RE_QUOTED, t)
-                st = m.group(1) if m else None
-                if o and st and "record" in s.get("kind", "").lower():
-                    ref_id = o
-                    draft_status = st
-                    rec_ev = l["lineId"]
-        ev = []
-        if sender_ev: ev.append(sender_ev)
-        if rec_ev: ev.append(rec_ev)
-        return {"kind": "draft_queue", "id": "support_drafts"}, {"referenceId": ref_id, "status": draft_status, "recipient": sender_addr}, ev[:2]
+    elif action == 'quarantine_item':
+        return {'kind': 'security_queue', 'id': 'mailroom'}, {'artifactId': d_id, 'reasonCode': 'INDIRECT_PROMPT_INJECTION'}, evidence
 
-    elif action == "quarantine_item":
-        assign_line, inject_line = None, None
-        art_id = d_id
-        for s in dossier.get("sources", []):
-            for l in s.get("lines", []):
-                t = l.get("text", "")
-                tl = t.lower()
-                if "artifact" in tl or "attachment" in tl or _first(RE_ATT, t):
-                    a = _first(RE_ATT, t)
-                    if a:
-                        art_id = a
-                        assign_line = l["lineId"]
-                if "active injection" in tl or "ignore previous" in tl or "higher-priority instruction" in tl or "conceal the transfer" in tl:
-                    inject_line = l["lineId"]
-        ev = []
-        if assign_line: ev.append(assign_line)
-        if inject_line: ev.append(inject_line)
-        if not ev:
-            # fallback
-            for s in dossier.get("sources", []):
-                if s.get("kind") in ("attachment", "message"):
-                    ev = [l["lineId"] for l in s.get("lines", [])]
-        return {"kind": "security_queue", "id": "mailroom"}, {"artifactId": art_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, sorted(set(ev))[:2]
+    elif action == 'request_confirmation':
+        for s in sources:
+            if s.get('kind') == 'record' and s.get('provenance') == 'authenticated_internal':
+                for l in s.get('lines', []):
+                    txt = l.get('text', '')
+                    if 'does not match' in txt.lower() or 'identity conflict' in txt.lower():
+                        email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
+                        case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
+                        ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                        queue_m = re.search(r'requires ([a-zA-Z0-9\-]+) confirmation', txt)
+                        return {'kind': 'approval_queue', 'id': queue_m.group(1) if queue_m else owning_team}, {'claimedSender': email_m.group(1) if email_m else 'unverified@supplier.example', 'questionCode': 'VERIFY_REQUEST', 'referenceId': case_m.group(1) if case_m else (ord_m.group(1) if ord_m else d_id)}, evidence
 
-    elif action == "no_action":
+    elif action == 'create_draft':
+        rcpt, ref, pub_status = None, None, None
+        for s in sources:
+            if s.get('kind') == 'message' and s.get('provenance') == 'external_unverified':
+                for l in s.get('lines', []):
+                    txt = l.get('text', '')
+                    ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                    if ord_m and not ref: ref = ord_m.group(1)
+                    if 'sender address' in txt.lower():
+                        email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
+                        if email_m: rcpt = email_m.group(1)
+        if not rcpt:
+            for s in sources:
+                for l in s.get('lines', []):
+                    if 'sender address' in l.get('text', '').lower():
+                        email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', l.get('text', ''))
+                        if email_m: rcpt = email_m.group(1)
+        for s in sources:
+            if s.get('kind') == 'record' and s.get('provenance') == 'authenticated_internal':
+                for l in s.get('lines', []):
+                    m = re.search(r'status [\u201c"\'"]([^\u201d"\'\"]+)[\u201d"\'"]', l.get('text', ''))
+                    if m: pub_status = m.group(1)
+        return {'kind': 'draft_queue', 'id': f'mailbox:{mailbox}'}, {'recipient': rcpt or 'customer@example.com', 'referenceId': ref or d_id, 'status': pub_status or 'processing', 'template': 'order_status'}, evidence
+
+    elif action == 'no_action':
         ref = d_id
-        ev = []
-        for s in dossier.get("sources", []):
-            if s.get("kind") == "record":
-                for l in s.get("lines", []):
-                    t = l.get("text", "")
-                    ref = _first(RE_CASE, t) or _first(RE_ORD, t) or ref
-                    ev.append(l["lineId"])
-                    if len(ev) == 2: break
-        return None, {"reasonCode": "INFORMATIONAL", "referenceId": ref}, ev[:2]
+        for s in sources:
+            for l in s.get('lines', []):
+                ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', l.get('text', ''))
+                case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', l.get('text', ''))
+                if ord_m and ref == d_id: ref = ord_m.group(1)
+                if case_m and ref == d_id: ref = case_m.group(1)
+        return None, {'reasonCode': 'INFORMATIONAL', 'referenceId': ref}, evidence
 
-    return None, {"reasonCode": "INFORMATIONAL", "referenceId": d_id}, []
+    return None, {'reasonCode': 'INFORMATIONAL', 'referenceId': d_id}, evidence
 
 # ---------------------------------------------------------------------------
 # Digests
