@@ -11,7 +11,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Globals and constants
 # ---------------------------------------------------------------------------
-CACHE_FILE = "q9_stable_cache.json"
+CACHE_FILE = os.path.join(os.path.dirname(__file__), "..", "q9_stable_cache.json")
 Q9_CACHE = {}
 Q9_EVALUATIONS = {}
 Q9_PROPOSALS = {}
