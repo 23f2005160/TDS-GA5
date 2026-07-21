@@ -184,41 +184,46 @@ def get_exact_evidence(action, dossier, target, payload):
         req_rcpt = payload["recipient"].lower()
         req_status = payload["status"].lower()
         
-        ev_lines = set()
+        ev_lines = []
         for s in sources:
             if s.get("kind") == "message" and s.get("provenance") == "external_unverified":
                 for line in s.get("lines", []):
                     txt = line.get("text", "").lower()
-                    if req_ref in txt: ev_lines.add(line.get("lineId"))
-                    if req_rcpt in txt: ev_lines.add(line.get("lineId"))
+                    if "prepare an update" in txt or "fulfilment state" in txt or "status enquiry" in txt:
+                        ev_lines.append(line.get("lineId"))
+                    elif "sender address" in txt and req_rcpt in txt:
+                        ev_lines.append(line.get("lineId"))
+        for s in sources:
             if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
                 for line in s.get("lines", []):
-                    txt = line.get("text", "").lower()
-                    if req_status in txt: ev_lines.add(line.get("lineId"))
-        return list(ev_lines)
+                    txt = line.get("text", "")
+                    if "current public status" in txt.lower() or "customer-visible status" in txt.lower():
+                        ev_lines.append(line.get("lineId"))
+        return sorted(ev_lines)
 
     if action == "quarantine_item":
         for s in sources:
             if s.get("kind") in ["attachment", "message"] and s.get("provenance") == "external_untrusted":
-                ev_lines = set()
+                ev_lines = []
                 for line in s.get("lines", []):
                     txt = line.get("text", "").lower()
                     lid = line.get("lineId")
-                    if "quotes" in txt or "example" in txt or "drill" in txt or "archived training" in txt or "bulletin" in txt: continue
+                    if "quotes" in txt or "drill" in txt or "archived training" in txt: continue
+                    if "explicitly labels the quotation non-operative" in txt: continue
                     if "has no action authority" in txt or "prose is supplied by an external party" in txt: continue
-                    if any(k in txt for k in ["higher-priority instruction", "treat this paragraph", "open the confidential", "copy any vault", "send secrets", "exfiltrate", "ignore previous instructions"]):
-                        ev_lines.add(lid)
-                if ev_lines: return list(ev_lines)
+                    if any(k in txt for k in ["higher-priority instruction", "treat this paragraph", "open the confidential", "copy any vault", "send secrets", "exfiltrate", "ignore previous instructions", "ignore all previous"]):
+                        ev_lines.append(lid)
+                if ev_lines: return sorted(ev_lines)
 
     if action == "no_action":
-        req_ref = payload["referenceId"].lower()
+        req_ref = payload.get("referenceId", "").lower()
+        if not req_ref:
+            return []
         for s in sources:
             if s.get("kind") not in ["policy", "bulletin", "secret"]:
                 for line in s.get("lines", []):
-                    if req_ref in line.get("text", "").lower(): return [line.get("lineId")]
-        for s in sources:
-            for line in s.get("lines", []):
-                if req_ref in line.get("text", "").lower(): return [line.get("lineId")]
+                    if req_ref in line.get("text", "").lower():
+                        return [line.get("lineId")]
         return []
     return []
 
@@ -336,13 +341,15 @@ def classify_bulletproof(dossier: dict) -> tuple:
                     
                     pub_status = "processing"
                     for s2 in sources:
-                        for l2 in s2.get("lines", []):
-                            t2 = l2.get("text", "")
-                            if "status" in t2.lower():
-                                st_m = re.search(r'status (?:is )?(?:exactly )?[“\'"]([^"’\'"]+)[”\'"]', t2.lower())
-                                if st_m:
-                                    pub_status = st_m.group(1)
-                                    break
+                        if s2.get("kind") == "record" and s2.get("provenance") == "authenticated_internal":
+                            for l2 in s2.get("lines", []):
+                                t2 = l2.get("text", "")
+                                m = re.search(r'status (?:is )?(?:exactly )?\u201c([^\u201d]+)\u201d', t2)
+                                if m: pub_status = m.group(1); break
+                                m = re.search(r"status (?:is )?(?:exactly )?'([^']+)'", t2)
+                                if m: pub_status = m.group(1); break
+                                m = re.search(r'status (?:is )?(?:exactly )?"([^"]+)"', t2)
+                                if m: pub_status = m.group(1); break
 
                     action = "create_draft"
                     target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
@@ -377,12 +384,15 @@ async def get_dossier_classification(dossier: dict) -> tuple:
             # Fix payload status if it was wrong (just in case LLM got it wrong)
             if action in ["create_draft", "send_approved_notice"]:
                 for s in dossier.get("sources", []):
-                    if s.get("kind") == "record":
+                    if s.get("kind") == "record" and s.get("provenance") == "authenticated_internal":
                         for l in s.get("lines", []):
-                            txt = l.get("text", "").lower()
-                            if "status" in txt:
-                                m = re.search(r'status (?:is )?(?:exactly )?[“\'"]([^"’\'"]+)[”\'"]', txt)
-                                if m: payload["status"] = m.group(1); break
+                            t2 = l.get("text", "")
+                            m = re.search(r'status (?:is )?(?:exactly )?\u201c([^\u201d]+)\u201d', t2)
+                            if m: payload["status"] = m.group(1); break
+                            m = re.search(r"status (?:is )?(?:exactly )?'([^']+)'", t2)
+                            if m: payload["status"] = m.group(1); break
+                            m = re.search(r'status (?:is )?(?:exactly )?"([^"]+)"', t2)
+                            if m: payload["status"] = m.group(1); break
                                 
             # Overwrite evidence with strict fields
             evidence = get_exact_evidence(action, dossier, target, payload)
