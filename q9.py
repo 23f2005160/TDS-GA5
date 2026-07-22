@@ -13,6 +13,7 @@ import json
 import re
 import hashlib
 import asyncio
+import tempfile
 import urllib.request
 import urllib.error
 import logging
@@ -24,12 +25,14 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Disk Persistence for Multi-Worker Deployments (Gunicorn / Render)
+# Use system temp directory to guarantee 100% read/write permissions on Render
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
+TMP_DIR = tempfile.gettempdir()
 
-EVAL_FILE = os.path.join(BASE_DIR, "q9_evaluations.json")
-PROP_FILE = os.path.join(BASE_DIR, "q9_proposals.json")
+EVAL_FILE = os.path.join(TMP_DIR, "ga5_q9_evaluations.json")
+PROP_FILE = os.path.join(TMP_DIR, "ga5_q9_proposals.json")
 CACHE_FILE = os.path.join(ROOT_DIR, "q9_stable_cache.json")
 
 def load_json(filepath: str) -> dict:
@@ -37,7 +40,8 @@ def load_json(filepath: str) -> dict:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error loading {filepath}: {e}")
             return {}
     return {}
 
@@ -492,7 +496,7 @@ async def handle_mailroom_actions(request: Request):
     if not eval_id or not operation or operation not in ("propose", "commit"):
         raise HTTPException(status_code=400, detail="Missing or invalid operation/evaluationId")
 
-    # Dynamic reload across Gunicorn workers for full multi-process sync
+    # Sync state across multi-worker deployment processes via /tmp
     Q9_EVALUATIONS.update(load_json(EVAL_FILE))
     Q9_PROPOSALS.update(load_json(PROP_FILE))
 
@@ -564,7 +568,7 @@ async def handle_mailroom_actions(request: Request):
             "isCompleted": False
         }
 
-        # Save to disk ONCE per batch request
+        # Save to disk ONCE per batch request in /tmp for multi-worker sync
         save_json(CACHE_FILE, Q9_CACHE)
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         save_json(PROP_FILE, Q9_PROPOSALS)
@@ -621,17 +625,13 @@ async def handle_mailroom_actions(request: Request):
             # Strict receipt verification according to spec:
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
-            is_valid_receipt = (
-                stored is not None and
-                valid_receipt_id and
-                stored.get("proposalDigest") == prop_digest and
-                stored.get("action") == action
-            )
+            # IF RECEIPT IS INVALID/TAMPERED/UNRECOGNIZED -> REJECT COMMIT WITH HTTP 400!
+            if not stored or not valid_receipt_id:
+                raise HTTPException(status_code=400, detail=f"Invalid or unrecognized receipt for dossierId {d_id}")
+            if stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
+                raise HTTPException(status_code=400, detail=f"Mismatched proposalDigest or action for dossierId {d_id}")
 
-            if not is_valid_receipt:
-                all_valid = False
-
-            status = "executed" if (is_valid_receipt and accepted) else "rejected"
+            status = "executed" if accepted else "rejected"
 
             outcomes.append({
                 "dossierId": d_id,
@@ -650,12 +650,9 @@ async def handle_mailroom_actions(request: Request):
             "outcomes": outcomes,
         }
 
-        # Set completion status ONLY when all receipts in commit are valid!
-        # Invalid receipt probes return status: rejected in outcomes without marking evaluation completed!
-        if all_valid:
-            cached["isCompleted"] = True
-            cached["commitReceiptsDigest"] = incoming_receipts_digest
-            cached["commitResponse"] = commit_response
+        cached["isCompleted"] = True
+        cached["commitReceiptsDigest"] = incoming_receipts_digest
+        cached["commitResponse"] = commit_response
 
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
