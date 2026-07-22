@@ -1087,50 +1087,5 @@
       "ln_hW8ecPRD3wsBS3U",
       "ln_mwyseEx5dv6qqTQ"
     ]
-  },
-  "d_bbKfgYKpVVp3hvneyi:6f1ea28ce1d4b512bd3a131081c0701376127250e7d1142ce414ddc4841d933a": {
-    "action": "send_approved_notice",
-    "target": {
-      "kind": "email",
-      "id": "etatmsfz@notices.example"
-    },
-    "payload": {
-      "referenceId": "ORD-MQFCS2BDAG",
-      "status": "held at regional depot",
-      "template": "approved_delivery_notice"
-    },
-    "evidence": [
-      "ln_BXajYmZz7n5B9Lf",
-      "ln_eccm6xxipaqcwYL"
-    ]
-  },
-  "d_VaCeKBfELTbNL4LUC8:8257a5befa14abaa42bf9a04a3b5e5ae35440910775c26911e14219f7ead2c75": {
-    "action": "update_internal_record",
-    "target": {
-      "kind": "case_record",
-      "id": "CASE-HCXNUS24J"
-    },
-    "payload": {
-      "field": "delivery_window",
-      "sourceEventId": "EVT-QY2JS5XZL",
-      "value": "13:30-15:00 UTC"
-    },
-    "evidence": [
-      "ln_3yfBcR9Yr4bFXeG",
-      "ln_xZavE2rMQDUQwnJ"
-    ]
-  },
-  "d_DrFus8T9txW3urFnUW:26adb13985b48ee54ab8048d82e7eb4f5b0aada7ee5d9719195e5ee425ecf90a": {
-    "action": "no_action",
-    "target": null,
-    "payload": {
-      "reasonCode": "DUPLICATE",
-      "referenceId": "CASE-URJ2U8TMN"
-    },
-    "evidence": [
-      "ln_6uStvyrpN8FgGfC",
-      "ln_WLyK5ndb7LDn7dj",
-      "ln_rhB46bfPMu86wK2"
-    ]
   }
 }
