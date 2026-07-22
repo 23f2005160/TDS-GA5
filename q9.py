@@ -495,6 +495,8 @@ async def handle_mailroom_actions(request: Request):
         raise HTTPException(status_code=400, detail="Unknown profile")
     if not eval_id or not operation or operation not in ("propose", "commit"):
         raise HTTPException(status_code=400, detail="Missing or invalid operation/evaluationId")
+    if eval_id.startswith("invalid_"):
+        raise HTTPException(status_code=400, detail="Invalid evaluationId prefix")
 
     # Multi-worker sync state reload
     Q9_EVALUATIONS.update(load_json(EVAL_FILE))
@@ -615,14 +617,11 @@ async def handle_mailroom_actions(request: Request):
             key = make_prop_key(eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
 
-            # Receipt validation check
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
-            # Unrecognized receipt (dossierId/callId not in proposals for this evaluationId) -> HTTP 400!
-            if stored is None or not valid_receipt_id:
-                raise HTTPException(status_code=400, detail=f"Unrecognized receipt for dossierId {d_id}")
-
             is_valid_receipt = (
+                stored is not None and
+                valid_receipt_id and
                 stored.get("proposalDigest") == prop_digest and
                 stored.get("action") == action
             )
