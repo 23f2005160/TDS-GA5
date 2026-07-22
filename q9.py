@@ -215,6 +215,7 @@ def solve_dossier_rule_based(dossier: dict) -> Tuple[str, Optional[dict], dict, 
     all_lines = get_lines(sources)
 
     ext_untrusted = get_lines(sources, provenance='external_untrusted')
+    ext_unverified = get_lines(sources, provenance='external_unverified')
     att_untrusted = get_lines(sources, kind='attachment', provenance='external_untrusted')
     msg_unverified = get_lines(sources, kind='message', provenance='external_unverified')
     event_signed = get_lines(sources, kind='event', provenance='signed_internal')
