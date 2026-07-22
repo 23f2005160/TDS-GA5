@@ -5,7 +5,7 @@ least-privilege action per dossier; `commit` binds grader receipts to those
 proposals and returns terminal outcomes.
 
 4-LEVEL DECISION CASCADE:
-1. Persistent Cache (SQLite WAL q9_v3_decisions with autocommit)
+1. Persistent Cache (SQLite WAL q9_v3_decisions with per-call post-fork connections)
 2. Dynamic Rule-Based Deterministic Solver (deterministic_decision)
 3. AIPIPE API (AIPIPE_KEY, gpt-4o)
 4. OpenRouter API (OPENROUTER_API_KEY, nvidia/nemotron-3-ultra-550b-a55b:free)
@@ -18,7 +18,6 @@ import os
 import re
 import sqlite3
 import tempfile
-import threading
 import urllib.request
 import urllib.error
 import logging
@@ -64,52 +63,66 @@ def _db_path():
         return os.path.join(tempfile.gettempdir(), "ga5.db")
 
 DB_PATH = _db_path()
-_lock = threading.Lock()
 
-# Use autocommit mode (isolation_level=None) so multi-worker reads always see fresh committed writes
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
-_conn.execute("PRAGMA journal_mode=WAL")
-_conn.execute("PRAGMA synchronous=NORMAL")
-_conn.execute("PRAGMA busy_timeout=5000")
-_conn.executescript(
-    """
-    CREATE TABLE IF NOT EXISTS q9_v3_decisions (
-        cache_key TEXT PRIMARY KEY,
-        proposal TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v3_calls (
-        call_id TEXT PRIMARY KEY,
-        proposal TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v3_evals (
-        eval_id TEXT PRIMARY KEY,
-        input_digest TEXT,
-        response TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v3_eval_calls (
-        eval_call TEXT PRIMARY KEY,
-        proposal TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v3_commits (
-        commit_key TEXT PRIMARY KEY,
-        response TEXT
-    );
-    CREATE TABLE IF NOT EXISTS q9_v3_effects (
-        effect_key TEXT PRIMARY KEY,
-        outcome TEXT
-    );
-    """
-)
+def init_db():
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS q9_v3_decisions (
+                    cache_key TEXT PRIMARY KEY,
+                    proposal TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v3_calls (
+                    call_id TEXT PRIMARY KEY,
+                    proposal TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v3_evals (
+                    eval_id TEXT PRIMARY KEY,
+                    input_digest TEXT,
+                    response TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v3_eval_calls (
+                    eval_call TEXT PRIMARY KEY,
+                    proposal TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v3_commits (
+                    commit_key TEXT PRIMARY KEY,
+                    response TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v3_effects (
+                    effect_key TEXT PRIMARY KEY,
+                    outcome TEXT
+                );
+                """
+            )
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+
+init_db()
 
 def _get(table, key_col, key):
-    with _lock:
-        return _conn.execute(
-            "SELECT * FROM %s WHERE %s=?" % (table, key_col), (key,)
-        ).fetchone()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn.execute(
+                f"SELECT * FROM {table} WHERE {key_col}=?", (key,)
+            ).fetchone()
+    except Exception as e:
+        logger.error(f"DB get error on {table}: {e}")
+        return None
 
 def _put(sql, params):
-    with _lock:
-        _conn.execute(sql, params)
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(sql, params)
+    except Exception as e:
+        logger.error(f"DB put error: {e}")
 
 # --------------------------------------------------------------- API Configs
 
