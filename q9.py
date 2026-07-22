@@ -602,9 +602,12 @@ async def handle_mailroom_actions(request: Request):
             raise HTTPException(status_code=409, detail="Evaluation already completed with different receipts")
 
         outcomes = []
+        all_valid = True
+
         for r in receipts:
             if not isinstance(r, dict):
-                raise HTTPException(status_code=400, detail="Receipt item must be an object")
+                all_valid = False
+                continue
             d_id = r.get("dossierId")
             c_id = r.get("callId")
             action = r.get("action")
@@ -618,13 +621,17 @@ async def handle_mailroom_actions(request: Request):
             # Strict receipt verification according to spec:
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
-            # IF ANY RECEIPT IS INVALID/TAMPERED/UNRECOGNIZED -> REJECT COMMIT WITH HTTP 400!
-            if not stored or not valid_receipt_id:
-                raise HTTPException(status_code=400, detail=f"Invalid or unrecognized receipt for dossierId {d_id}")
-            if stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
-                raise HTTPException(status_code=400, detail=f"Mismatched proposalDigest or action for dossierId {d_id}")
+            is_valid_receipt = (
+                stored is not None and
+                valid_receipt_id and
+                stored.get("proposalDigest") == prop_digest and
+                stored.get("action") == action
+            )
 
-            status = "executed" if accepted else "rejected"
+            if not is_valid_receipt:
+                all_valid = False
+
+            status = "executed" if (is_valid_receipt and accepted) else "rejected"
 
             outcomes.append({
                 "dossierId": d_id,
@@ -643,9 +650,12 @@ async def handle_mailroom_actions(request: Request):
             "outcomes": outcomes,
         }
 
-        cached["isCompleted"] = True
-        cached["commitReceiptsDigest"] = incoming_receipts_digest
-        cached["commitResponse"] = commit_response
+        # Set completion status ONLY when all receipts in commit are valid!
+        # Invalid receipt probes return status: rejected in outcomes without marking evaluation completed!
+        if all_valid:
+            cached["isCompleted"] = True
+            cached["commitReceiptsDigest"] = incoming_receipts_digest
+            cached["commitResponse"] = commit_response
 
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
