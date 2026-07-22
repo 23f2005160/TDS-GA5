@@ -4,7 +4,7 @@ Full automatic, bulletproof, high-performance universal solver.
 
 CASCADE ORDER for fresh dossiers:
 1. Cache lookup (q9_stable_cache.json)
-2. Rule-based logic solver (instant, <1ms)
+2. Rule-Based Logic Solver (instant, <1ms)
 3. AIPIPE API (AIPIPE_KEY, model gpt-4o, 3s timeout)
 4. OpenRouter API (OPENROUTER_API_KEY, model nvidia/nemotron-3-ultra-550b-a55b:free, 3s timeout)
 """
@@ -569,17 +569,25 @@ async def handle_mailroom_actions(request: Request):
     if operation == "commit":
         input_digest = body.get("inputDigest")
         receipts = body.get("receipts")
-        if not isinstance(receipts, list):
-            raise HTTPException(status_code=422, detail="receipts must be a list")
 
         if eval_id not in Q9_EVALUATIONS:
             raise HTTPException(status_code=400, detail="Unknown evaluationId for commit")
 
         cached = Q9_EVALUATIONS[eval_id]
-        if cached.get("isCompleted"):
-            raise HTTPException(status_code=409, detail="Evaluation already completed")
+
+        # 1. Digest Conflict Check (Must return HTTP 409)
         if input_digest != cached.get("inputDigest"):
             raise HTTPException(status_code=409, detail="Commit inputDigest mismatch")
+
+        # 2. Commit Replay Check (Must return cached commitResponse with HTTP 200)
+        if cached.get("isCompleted"):
+            if "commitResponse" in cached:
+                return cached["commitResponse"]
+            else:
+                raise HTTPException(status_code=409, detail="Evaluation already completed")
+
+        if not isinstance(receipts, list):
+            raise HTTPException(status_code=422, detail="receipts must be a list")
 
         outcomes = []
         for r in receipts:
@@ -614,15 +622,17 @@ async def handle_mailroom_actions(request: Request):
                 "status": status,
             })
 
-        cached["isCompleted"] = True
-        save_json(EVAL_FILE, Q9_EVALUATIONS)
-
-        return {
+        commit_response = {
             "profile": "ga5-mailroom-action-gate/v2",
             "evaluationId": eval_id,
             "status": "completed",
             "inputDigest": input_digest,
             "outcomes": outcomes,
         }
+
+        cached["isCompleted"] = True
+        cached["commitResponse"] = commit_response
+        save_json(EVAL_FILE, Q9_EVALUATIONS)
+        return commit_response
 
     raise HTTPException(status_code=400, detail=f"Invalid operation: {operation}")
