@@ -5,7 +5,7 @@ least-privilege action per dossier; `commit` binds grader receipts to those
 proposals and returns terminal outcomes.
 
 4-LEVEL DECISION CASCADE:
-1. Persistent Cache (Dual In-Memory + SQLite WAL q9_v3_decisions)
+1. Persistent Cache (Atomic OS files + SQLite WAL q9_v3_decisions)
 2. Dynamic Rule-Based Deterministic Solver (deterministic_decision)
 3. AIPIPE API (AIPIPE_KEY, gpt-4o)
 4. OpenRouter API (OPENROUTER_API_KEY, nvidia/nemotron-3-ultra-550b-a55b:free)
@@ -45,7 +45,7 @@ MAX_RECEIPTS = 400
 MAX_LINES = 60
 MAX_LINE_CHARS = 320
 
-# ------------------------------------------------------------------ storage & Dual Persistence
+# ------------------------------------------------------------------ storage & Multi-Worker Sync
 
 def _db_path():
     want = os.environ.get("GA5_DB", "/tmp/ga5.db")
@@ -60,7 +60,6 @@ def _db_path():
 
 DB_PATH = _db_path()
 
-# In-Memory Cache for 0ms ultra-fast hits across same process threads
 IN_MEMORY_EVALS = {}
 IN_MEMORY_DECISIONS = {}
 IN_MEMORY_COMMITS = {}
@@ -128,29 +127,74 @@ def _put(sql, params):
 def get_eval(eval_id: str):
     if eval_id in IN_MEMORY_EVALS:
         return IN_MEMORY_EVALS[eval_id]
+
+    eval_file = os.path.join(tempfile.gettempdir(), f"q9_eval_{eval_id}.json")
+    if os.path.exists(eval_file):
+        try:
+            with open(eval_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                val = (data["inputDigest"], data["response"])
+                IN_MEMORY_EVALS[eval_id] = val
+                return val
+        except Exception:
+            pass
+
     row = _get("q9_v3_evals", "eval_id", eval_id)
     if row is not None:
         val = (row[1], json.loads(row[2]))
         IN_MEMORY_EVALS[eval_id] = val
         return val
+
     return None
 
 def put_eval(eval_id: str, input_digest: str, response_dict: dict):
     IN_MEMORY_EVALS[eval_id] = (input_digest, response_dict)
+
+    eval_file = os.path.join(tempfile.gettempdir(), f"q9_eval_{eval_id}.json")
+    try:
+        tmp_f = eval_file + ".tmp"
+        with open(tmp_f, "w", encoding="utf-8") as f:
+            json.dump({"inputDigest": input_digest, "response": response_dict}, f, ensure_ascii=False)
+        os.replace(tmp_f, eval_file)
+    except Exception as e:
+        logger.error(f"Error saving eval file: {e}")
+
     _put("INSERT OR REPLACE INTO q9_v3_evals VALUES (?,?,?)", (eval_id, input_digest, json.dumps(response_dict, ensure_ascii=False)))
 
 def get_commit(commit_key: str):
     if commit_key in IN_MEMORY_COMMITS:
         return IN_MEMORY_COMMITS[commit_key]
+
+    commit_file = os.path.join(tempfile.gettempdir(), f"q9_commit_{commit_key}.json")
+    if os.path.exists(commit_file):
+        try:
+            with open(commit_file, "r", encoding="utf-8") as f:
+                val = json.load(f)
+                IN_MEMORY_COMMITS[commit_key] = val
+                return val
+        except Exception:
+            pass
+
     hit = _get("q9_v3_commits", "commit_key", commit_key)
     if hit is not None:
         val = json.loads(hit[1])
         IN_MEMORY_COMMITS[commit_key] = val
         return val
+
     return None
 
 def put_commit(commit_key: str, response_dict: dict):
     IN_MEMORY_COMMITS[commit_key] = response_dict
+
+    commit_file = os.path.join(tempfile.gettempdir(), f"q9_commit_{commit_key}.json")
+    try:
+        tmp_f = commit_file + ".tmp"
+        with open(tmp_f, "w", encoding="utf-8") as f:
+            json.dump(response_dict, f, ensure_ascii=False)
+        os.replace(tmp_f, commit_file)
+    except Exception as e:
+        logger.error(f"Error saving commit file: {e}")
+
     _put("INSERT OR REPLACE INTO q9_v3_commits VALUES (?,?)", (commit_key, json.dumps(response_dict, ensure_ascii=False)))
 
 # --------------------------------------------------------------- API Configs
