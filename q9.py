@@ -496,7 +496,7 @@ async def handle_mailroom_actions(request: Request):
     if not eval_id or not operation or operation not in ("propose", "commit"):
         raise HTTPException(status_code=400, detail="Missing or invalid operation/evaluationId")
 
-    # Sync state across multi-worker deployment processes via /tmp
+    # Multi-worker sync state reload
     Q9_EVALUATIONS.update(load_json(EVAL_FILE))
     Q9_PROPOSALS.update(load_json(PROP_FILE))
 
@@ -517,14 +517,11 @@ async def handle_mailroom_actions(request: Request):
 
         input_digest = canonical_json_digest(dossiers)
 
-        # Multi-worker sync reload
-        Q9_EVALUATIONS.update(load_json(EVAL_FILE))
-
         # Replay & Conflict Checks for Propose
         if eval_id in Q9_EVALUATIONS:
             cached = Q9_EVALUATIONS[eval_id]
             if cached.get("inputDigest") != input_digest or cached.get("isCompleted"):
-                raise HTTPException(status_code=409, detail="evaluationId reused with different content or already completed")
+                raise HTTPException(status_code=409, detail="Propose evaluationId conflict")
             return cached["proposeResponse"]
 
         # Evaluate dossiers concurrently
@@ -579,10 +576,6 @@ async def handle_mailroom_actions(request: Request):
         input_digest = body.get("inputDigest")
         receipts = body.get("receipts")
 
-        # Multi-worker sync reload
-        Q9_EVALUATIONS.update(load_json(EVAL_FILE))
-        Q9_PROPOSALS.update(load_json(PROP_FILE))
-
         if eval_id not in Q9_EVALUATIONS:
             raise HTTPException(status_code=400, detail="Unknown evaluationId for commit")
 
@@ -622,16 +615,23 @@ async def handle_mailroom_actions(request: Request):
             key = make_prop_key(eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
 
-            # Strict receipt verification according to spec:
+            # Receipt validation check
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
-            # IF RECEIPT IS INVALID/TAMPERED/UNRECOGNIZED -> REJECT COMMIT WITH HTTP 400!
-            if not stored or not valid_receipt_id:
-                raise HTTPException(status_code=400, detail=f"Invalid or unrecognized receipt for dossierId {d_id}")
-            if stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
-                raise HTTPException(status_code=400, detail=f"Mismatched proposalDigest or action for dossierId {d_id}")
+            # Unrecognized receipt (dossierId/callId not in proposals for this evaluationId) -> HTTP 400!
+            if stored is None or not valid_receipt_id:
+                raise HTTPException(status_code=400, detail=f"Unrecognized receipt for dossierId {d_id}")
 
-            status = "executed" if accepted else "rejected"
+            is_valid_receipt = (
+                stored.get("proposalDigest") == prop_digest and
+                stored.get("action") == action
+            )
+
+            if not is_valid_receipt:
+                all_valid = False
+
+            # Valid receipts with accepted: true -> executed; otherwise -> rejected
+            status = "executed" if (is_valid_receipt and accepted) else "rejected"
 
             outcomes.append({
                 "dossierId": d_id,
@@ -650,9 +650,10 @@ async def handle_mailroom_actions(request: Request):
             "outcomes": outcomes,
         }
 
-        cached["isCompleted"] = True
-        cached["commitReceiptsDigest"] = incoming_receipts_digest
-        cached["commitResponse"] = commit_response
+        if all_valid:
+            cached["isCompleted"] = True
+            cached["commitReceiptsDigest"] = incoming_receipts_digest
+            cached["commitResponse"] = commit_response
 
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
