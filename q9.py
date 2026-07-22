@@ -5,7 +5,7 @@ least-privilege action per dossier; `commit` binds grader receipts to those
 proposals and returns terminal outcomes.
 
 4-LEVEL DECISION CASCADE:
-1. Persistent Cache (SQLite WAL q9_v3_decisions)
+1. Persistent Cache (SQLite WAL q9_v3_decisions with autocommit)
 2. Dynamic Rule-Based Deterministic Solver (deterministic_decision)
 3. AIPIPE API (AIPIPE_KEY, gpt-4o)
 4. OpenRouter API (OPENROUTER_API_KEY, nvidia/nemotron-3-ultra-550b-a55b:free)
@@ -65,9 +65,12 @@ def _db_path():
 
 DB_PATH = _db_path()
 _lock = threading.Lock()
-_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+# Use autocommit mode (isolation_level=None) so multi-worker reads always see fresh committed writes
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
 _conn.execute("PRAGMA journal_mode=WAL")
 _conn.execute("PRAGMA synchronous=NORMAL")
+_conn.execute("PRAGMA busy_timeout=5000")
 _conn.executescript(
     """
     CREATE TABLE IF NOT EXISTS q9_v3_decisions (
@@ -97,7 +100,6 @@ _conn.executescript(
     );
     """
 )
-_conn.commit()
 
 def _get(table, key_col, key):
     with _lock:
@@ -108,7 +110,6 @@ def _get(table, key_col, key):
 def _put(sql, params):
     with _lock:
         _conn.execute(sql, params)
-        _conn.commit()
 
 # --------------------------------------------------------------- API Configs
 
