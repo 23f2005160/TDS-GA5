@@ -23,6 +23,8 @@ from fastapi import APIRouter, Request, HTTPException
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+PROFILE = "ga5-mailroom-action-gate/v2"
+
 # ---------------------------------------------------------------------------
 # Disk Persistence for Multi-Worker Deployments (Gunicorn / Render)
 # Use system temp directory to guarantee 100% read/write permissions on Render
@@ -33,6 +35,7 @@ TMP_DIR = tempfile.gettempdir()
 
 EVAL_FILE = os.path.join(TMP_DIR, "ga5_q9_evaluations.json")
 PROP_FILE = os.path.join(TMP_DIR, "ga5_q9_proposals.json")
+COMMITS_FILE = os.path.join(TMP_DIR, "ga5_q9_commits.json")
 CACHE_FILE = os.path.join(ROOT_DIR, "q9_stable_cache.json")
 
 def load_json(filepath: str) -> dict:
@@ -60,6 +63,7 @@ def make_prop_key(eval_id: str, dossier_id: str, call_id: str) -> str:
 Q9_CACHE = load_json(CACHE_FILE)
 Q9_EVALUATIONS = load_json(EVAL_FILE)
 Q9_PROPOSALS = load_json(PROP_FILE)
+Q9_COMMITS = load_json(COMMITS_FILE)
 
 # ---------------------------------------------------------------------------
 # API Configurations (Strictly from Environment Variables)
@@ -118,18 +122,6 @@ def compute_proposal_digest(dossier_id: str, call_id: str, action: str,
         "payload": payload or {},
         "evidence": sorted(evidence) if evidence else [],
     }
-    return canonical_json_digest(core)
-
-def commit_receipts_identity_digest(receipts: list) -> str:
-    core = [
-        {
-            "dossierId": r.get("dossierId") or "",
-            "callId": r.get("callId") or "",
-            "proposalDigest": r.get("proposalDigest") or "",
-            "receiptId": r.get("receiptId") or "",
-        }
-        for r in receipts if isinstance(r, dict)
-    ]
     return canonical_json_digest(core)
 
 # ---------------------------------------------------------------------------
@@ -491,7 +483,7 @@ async def handle_mailroom_actions(request: Request):
     operation = body.get("operation")
     eval_id = body.get("evaluationId")
 
-    if profile != "ga5-mailroom-action-gate/v2":
+    if profile != PROFILE:
         raise HTTPException(status_code=400, detail="Unknown profile")
     if not eval_id or not operation or operation not in ("propose", "commit"):
         raise HTTPException(status_code=400, detail="Missing or invalid operation/evaluationId")
@@ -499,6 +491,7 @@ async def handle_mailroom_actions(request: Request):
     # Multi-worker sync state reload
     Q9_EVALUATIONS.update(load_json(EVAL_FILE))
     Q9_PROPOSALS.update(load_json(PROP_FILE))
+    Q9_COMMITS.update(load_json(COMMITS_FILE))
 
     # ---------------- OPERATION: PROPOSE ----------------
     if operation == "propose":
@@ -520,9 +513,9 @@ async def handle_mailroom_actions(request: Request):
         # Replay & Conflict Checks for Propose
         if eval_id in Q9_EVALUATIONS:
             cached = Q9_EVALUATIONS[eval_id]
-            if cached.get("inputDigest") != input_digest or cached.get("isCompleted"):
-                raise HTTPException(status_code=409, detail="Propose evaluationId conflict")
-            return cached["proposeResponse"]
+            if cached.get("inputDigest") == input_digest:
+                return cached["proposeResponse"]
+            raise HTTPException(status_code=409, detail="evaluationId already used with different content")
 
         # Evaluate dossiers concurrently
         results = await asyncio.gather(*[decide(d) for d in dossiers])
@@ -532,27 +525,23 @@ async def handle_mailroom_actions(request: Request):
             d_id = d["dossierId"]
             call_id = "call-" + hashlib.sha256((d["dossierId"] + content_fingerprint(d)).encode("utf-8")).hexdigest()[:24]
             evidence = sorted(set(evidence))
-            prop_digest = compute_proposal_digest(d_id, call_id, action, target, payload, evidence)
 
-            proposals.append({
+            prop = {
                 "dossierId": d_id,
                 "callId": call_id,
                 "action": action,
                 "target": target,
                 "payload": payload,
                 "evidence": evidence
-            })
-
-            Q9_PROPOSALS[make_prop_key(eval_id, d_id, call_id)] = {
-                "proposalDigest": prop_digest,
-                "action": action,
-                "target": target,
-                "payload": payload,
-                "evidence": evidence,
             }
+            prop_digest = compute_proposal_digest(d_id, call_id, action, target, payload, evidence)
+            prop["proposalDigest"] = prop_digest
+            proposals.append(prop)
+
+            Q9_PROPOSALS[make_prop_key(eval_id, d_id, call_id)] = prop
 
         response_body = {
-            "profile": "ga5-mailroom-action-gate/v2",
+            "profile": PROFILE,
             "evaluationId": eval_id,
             "status": "awaiting_receipts",
             "inputDigest": input_digest,
@@ -562,7 +551,7 @@ async def handle_mailroom_actions(request: Request):
         Q9_EVALUATIONS[eval_id] = {
             "inputDigest": input_digest,
             "proposeResponse": response_body,
-            "isCompleted": False
+            "proposals": proposals
         }
 
         # Save to disk ONCE per batch request in /tmp for multi-worker sync
@@ -577,82 +566,74 @@ async def handle_mailroom_actions(request: Request):
         receipts = body.get("receipts")
 
         if eval_id not in Q9_EVALUATIONS:
-            raise HTTPException(status_code=409, detail="Unknown evaluationId for commit conflict")
+            raise HTTPException(status_code=409, detail="unknown evaluationId")
 
-        cached = Q9_EVALUATIONS[eval_id]
+        cached_eval = Q9_EVALUATIONS[eval_id]
+        if cached_eval.get("inputDigest") != input_digest:
+            raise HTTPException(status_code=409, detail="inputDigest does not match evaluation")
 
-        # 1. Digest Conflict Check (Must return HTTP 409)
-        if input_digest != cached.get("inputDigest"):
-            raise HTTPException(status_code=409, detail="Commit inputDigest mismatch")
+        if not isinstance(receipts, list) or not receipts:
+            raise HTTPException(status_code=422, detail="receipts must be a non-empty array")
 
-        if not isinstance(receipts, list):
-            raise HTTPException(status_code=422, detail="receipts must be a list")
+        commit_key = canonical_json_digest({"evaluationId": eval_id, "inputDigest": input_digest, "receipts": receipts})
+        if commit_key in Q9_COMMITS:
+            return Q9_COMMITS[commit_key]  # Exact commit replay
 
-        incoming_receipts_digest = commit_receipts_identity_digest(receipts)
+        # Match every receipt to its persisted proposal, or reject the whole commit with 409 Conflict
+        stored_proposals = cached_eval.get("proposals", [])
+        by_call = {p["callId"]: p for p in stored_proposals}
 
-        # 2. Exact Commit Replay Check & Conflict Rejection
-        if cached.get("isCompleted"):
-            if cached.get("commitReceiptsDigest") == incoming_receipts_digest:
-                if "commitResponse" in cached:
-                    return cached["commitResponse"]
-            # Reused evaluationId on completed evaluation with different receipts -> HTTP 409 Conflict
-            raise HTTPException(status_code=409, detail="Evaluation already completed with different receipts")
-
-        outcomes = []
-        all_valid = True
-
+        bound = []
         for r in receipts:
             if not isinstance(r, dict):
-                all_valid = False
-                continue
-            d_id = r.get("dossierId")
-            c_id = r.get("callId")
-            action = r.get("action")
-            accepted = bool(r.get("accepted", False))
-            prop_digest = r.get("proposalDigest")
-            receipt_id = r.get("receiptId")
+                raise HTTPException(status_code=422, detail="each receipt must be an object")
+            call_id = r.get("callId", "").strip()
+            proposal = by_call.get(call_id)
 
-            key = make_prop_key(eval_id, d_id, c_id)
-            stored = Q9_PROPOSALS.get(key)
+            # Receipt validation according to exact friend spec: mismatch -> 409 Conflict!
+            if proposal is None:
+                raise HTTPException(status_code=409, detail=f"receipt callId {call_id} does not belong to evaluation {eval_id}")
+            if r.get("dossierId") != proposal["dossierId"]:
+                raise HTTPException(status_code=409, detail=f"receipt dossierId does not match proposal {call_id}")
+            if r.get("action") != proposal["action"]:
+                raise HTTPException(status_code=409, detail=f"receipt action does not match proposal {call_id}")
 
-            valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
-
-            is_valid_receipt = (
-                stored is not None and
-                valid_receipt_id and
-                stored.get("proposalDigest") == prop_digest and
-                stored.get("action") == action
+            expected_digest = compute_proposal_digest(
+                proposal["dossierId"], proposal["callId"], proposal["action"],
+                proposal["target"], proposal["payload"], proposal["evidence"]
             )
+            if r.get("proposalDigest") != expected_digest:
+                raise HTTPException(status_code=409, detail=f"receipt proposalDigest does not match proposal {call_id}")
 
-            if not is_valid_receipt:
-                all_valid = False
+            bound.append((r, proposal))
 
-            # Valid receipts with accepted: true -> executed; otherwise -> rejected
-            status = "executed" if (is_valid_receipt and accepted) else "rejected"
-
-            outcomes.append({
-                "dossierId": d_id,
-                "callId": c_id,
-                "action": action,
-                "proposalDigest": prop_digest,
-                "receiptId": receipt_id,
-                "status": status,
-            })
+        outcomes = []
+        for r, proposal in bound:
+            call_id = proposal["callId"]
+            accepted = r.get("accepted") is True
+            outcome = {
+                "dossierId": proposal["dossierId"],
+                "callId": call_id,
+                "action": proposal["action"],
+                "proposalDigest": compute_proposal_digest(
+                    proposal["dossierId"], proposal["callId"], proposal["action"],
+                    proposal["target"], proposal["payload"], proposal["evidence"]
+                ),
+                "receiptId": r.get("receiptId") if isinstance(r.get("receiptId"), str) else "",
+                "status": "executed" if accepted else "rejected",
+            }
+            outcomes.append(outcome)
 
         commit_response = {
-            "profile": "ga5-mailroom-action-gate/v2",
+            "profile": PROFILE,
             "evaluationId": eval_id,
             "status": "completed",
             "inputDigest": input_digest,
             "outcomes": outcomes,
         }
 
-        if all_valid:
-            cached["isCompleted"] = True
-            cached["commitReceiptsDigest"] = incoming_receipts_digest
-            cached["commitResponse"] = commit_response
-
-        save_json(EVAL_FILE, Q9_EVALUATIONS)
+        Q9_COMMITS[commit_key] = commit_response
+        save_json(COMMITS_FILE, Q9_COMMITS)
         return commit_response
 
     raise HTTPException(status_code=400, detail=f"Invalid operation: {operation}")
