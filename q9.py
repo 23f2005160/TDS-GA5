@@ -685,6 +685,8 @@ async def do_propose(body):
     cached, pending, resolved = {}, [], {}
     for did, fp, d in zip(ids, fingerprints, dossiers):
         hit = _get("q9_v3_decisions", "cache_key", did + "|" + fp)
+        if hit is None:
+            hit = _get("q9_v3_decisions", "cache_key", did + ":" + fp)
         if hit is not None:
             cached[did] = json.loads(hit[1])
             continue
@@ -707,6 +709,7 @@ async def do_propose(body):
             blob = canonical(proposal)
             if raw is not None:
                 _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + "|" + fp, blob))
+                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + ":" + fp, blob))
             _put("INSERT OR REPLACE INTO q9_v3_calls VALUES (?,?)", (proposal["callId"], blob))
         _put("INSERT OR REPLACE INTO q9_v3_eval_calls VALUES (?,?)", (eval_id + "|" + proposal["callId"], canonical(proposal)))
         proposals.append(proposal)
