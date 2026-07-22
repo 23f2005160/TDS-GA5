@@ -579,7 +579,7 @@ async def handle_mailroom_actions(request: Request):
         receipts = body.get("receipts")
 
         if eval_id not in Q9_EVALUATIONS:
-            raise HTTPException(status_code=400, detail="Unknown evaluationId for commit")
+            raise HTTPException(status_code=409, detail="Unknown evaluationId for commit conflict")
 
         cached = Q9_EVALUATIONS[eval_id]
 
