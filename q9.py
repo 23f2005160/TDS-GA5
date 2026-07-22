@@ -465,8 +465,8 @@ async def handle_mailroom_actions(request: Request):
 
     if profile != "ga5-mailroom-action-gate/v2":
         raise HTTPException(status_code=400, detail="Unknown profile")
-    if not eval_id or not operation:
-        raise HTTPException(status_code=400, detail="Missing evaluationId or operation")
+    if not eval_id or not operation or operation not in ("propose", "commit"):
+        raise HTTPException(status_code=400, detail="Missing or invalid operation/evaluationId")
 
     # Dynamic reload across Gunicorn workers for full multi-process sync
     Q9_EVALUATIONS.update(load_json(EVAL_FILE))
@@ -569,10 +569,12 @@ async def handle_mailroom_actions(request: Request):
             else:
                 raise HTTPException(status_code=409, detail="Commit content conflict")
 
+        # 3. Verify ALL receipts against persisted proposals for this evaluation!
+        # If any receipt has an unknown dossierId/callId/action or wrong proposalDigest, REJECT the commit request with HTTP 400!
         outcomes = []
         for r in receipts:
             if not isinstance(r, dict):
-                continue
+                raise HTTPException(status_code=400, detail="Receipt item must be an object")
             d_id = r.get("dossierId")
             c_id = r.get("callId")
             action = r.get("action")
@@ -583,15 +585,14 @@ async def handle_mailroom_actions(request: Request):
             key = make_prop_key(eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
 
-            # Strict receipt verification
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
             if not stored or not valid_receipt_id:
-                status = "rejected"
-            elif stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
-                status = "rejected"
-            else:
-                status = "executed" if accepted else "rejected"
+                raise HTTPException(status_code=400, detail=f"Invalid or unrecognized receipt for dossierId {d_id}")
+            if stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
+                raise HTTPException(status_code=400, detail=f"Mismatched proposalDigest or action for dossierId {d_id}")
+
+            status = "executed" if accepted else "rejected"
 
             outcomes.append({
                 "dossierId": d_id,
