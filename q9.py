@@ -338,9 +338,10 @@ def solve_dossier_rule_based(dossier: dict) -> Tuple[str, Optional[dict], dict, 
     else:  # no_action
         dup_rule = find_line(policy_signed, 'duplicate', 'informational') or find_line(policy_signed, 'second side effect')
         rec_line = find_line(record_auth, 'records this item as')
-        follow_up = None
-        for ln in record_auth:
-            if ln != rec_line: follow_up = ln; break
+        follow_up = find_line(msg_unverified + ext_unverified, 'follow-up') or find_line(msg_unverified + ext_unverified, 'no new change')
+        if not follow_up:
+            for ln in record_auth:
+                if ln != rec_line: follow_up = ln; break
         case_id = extract_case(rec_line.get('text')) if rec_line else None
         reason = 'INFORMATIONAL'
         if rec_line:
@@ -489,6 +490,10 @@ async def handle_mailroom_actions(request: Request):
     if not eval_id or not operation:
         raise HTTPException(status_code=400, detail="Missing evaluationId or operation")
 
+    # Dynamic reload across Gunicorn workers for full multi-process sync
+    Q9_EVALUATIONS.update(load_json(EVAL_FILE))
+    Q9_PROPOSALS.update(load_proposals())
+
     # ---------------- OPERATION: PROPOSE ----------------
     if operation == "propose":
         dossiers = body.get("dossiers")
@@ -506,9 +511,10 @@ async def handle_mailroom_actions(request: Request):
 
         input_digest = canonical_json_digest(dossiers)
 
+        # Conflict & Replay Check
         if eval_id in Q9_EVALUATIONS:
             cached = Q9_EVALUATIONS[eval_id]
-            if cached["inputDigest"] != input_digest or cached.get("isCompleted"):
+            if cached.get("inputDigest") != input_digest or cached.get("isCompleted"):
                 raise HTTPException(status_code=409, detail="evaluationId reused with different content or already completed")
             return cached["proposeResponse"]
 
@@ -570,7 +576,9 @@ async def handle_mailroom_actions(request: Request):
             raise HTTPException(status_code=400, detail="Unknown evaluationId for commit")
 
         cached = Q9_EVALUATIONS[eval_id]
-        if input_digest != cached["inputDigest"]:
+        if cached.get("isCompleted"):
+            raise HTTPException(status_code=409, detail="Evaluation already completed")
+        if input_digest != cached.get("inputDigest"):
             raise HTTPException(status_code=409, detail="Commit inputDigest mismatch")
 
         outcomes = []
@@ -587,11 +595,12 @@ async def handle_mailroom_actions(request: Request):
             key = (eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
 
+            # Strict receipt verification
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
             if not stored or not valid_receipt_id:
                 status = "rejected"
-            elif stored["proposalDigest"] != prop_digest or stored["action"] != action:
+            elif stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
                 status = "rejected"
             else:
                 status = "executed" if accepted else "rejected"
