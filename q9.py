@@ -50,34 +50,12 @@ def save_json(filepath: str, data: dict):
     except Exception as e:
         logger.error(f"Error saving {filepath}: {e}")
 
-def load_proposals() -> dict:
-    if os.path.exists(PROP_FILE):
-        try:
-            with open(PROP_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                res = {}
-                for k, v in raw.items():
-                    parts = k.split("|")
-                    if len(parts) == 3:
-                        res[(parts[0], parts[1], parts[2])] = v
-                return res
-        except Exception:
-            return {}
-    return {}
-
-def save_proposals(data: dict):
-    try:
-        tmp = PROP_FILE + ".tmp"
-        serializable = {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in data.items()}
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, PROP_FILE)
-    except Exception as e:
-        logger.error(f"Error saving proposals: {e}")
+def make_prop_key(eval_id: str, dossier_id: str, call_id: str) -> str:
+    return f"{eval_id}|{dossier_id}|{call_id}"
 
 Q9_CACHE = load_json(CACHE_FILE)
 Q9_EVALUATIONS = load_json(EVAL_FILE)
-Q9_PROPOSALS = load_proposals()
+Q9_PROPOSALS = load_json(PROP_FILE)
 
 # ---------------------------------------------------------------------------
 # API Configurations (Strictly from Environment Variables)
@@ -492,7 +470,7 @@ async def handle_mailroom_actions(request: Request):
 
     # Dynamic reload across Gunicorn workers for full multi-process sync
     Q9_EVALUATIONS.update(load_json(EVAL_FILE))
-    Q9_PROPOSALS.update(load_proposals())
+    Q9_PROPOSALS.update(load_json(PROP_FILE))
 
     # ---------------- OPERATION: PROPOSE ----------------
     if operation == "propose":
@@ -511,7 +489,7 @@ async def handle_mailroom_actions(request: Request):
 
         input_digest = canonical_json_digest(dossiers)
 
-        # Conflict & Replay Check
+        # Replay & Conflict Checks for Propose
         if eval_id in Q9_EVALUATIONS:
             cached = Q9_EVALUATIONS[eval_id]
             if cached.get("inputDigest") != input_digest or cached.get("isCompleted"):
@@ -537,7 +515,7 @@ async def handle_mailroom_actions(request: Request):
                 "evidence": evidence
             })
 
-            Q9_PROPOSALS[(eval_id, d_id, call_id)] = {
+            Q9_PROPOSALS[make_prop_key(eval_id, d_id, call_id)] = {
                 "proposalDigest": prop_digest,
                 "action": action,
                 "target": target,
@@ -559,10 +537,10 @@ async def handle_mailroom_actions(request: Request):
             "isCompleted": False
         }
 
-        # Save to disk ONCE per batch request (non-blocking)
+        # Save to disk ONCE per batch request
         save_json(CACHE_FILE, Q9_CACHE)
         save_json(EVAL_FILE, Q9_EVALUATIONS)
-        save_proposals(Q9_PROPOSALS)
+        save_json(PROP_FILE, Q9_PROPOSALS)
         return response_body
 
     # ---------------- OPERATION: COMMIT ----------------
@@ -579,15 +557,17 @@ async def handle_mailroom_actions(request: Request):
         if input_digest != cached.get("inputDigest"):
             raise HTTPException(status_code=409, detail="Commit inputDigest mismatch")
 
-        # 2. Commit Replay Check (Must return cached commitResponse with HTTP 200)
-        if cached.get("isCompleted"):
-            if "commitResponse" in cached:
-                return cached["commitResponse"]
-            else:
-                raise HTTPException(status_code=409, detail="Evaluation already completed")
-
         if not isinstance(receipts, list):
             raise HTTPException(status_code=422, detail="receipts must be a list")
+
+        incoming_receipts_digest = canonical_json_digest(receipts)
+
+        # 2. Replay & Conflict Check for Commit
+        if cached.get("isCompleted"):
+            if cached.get("commitReceiptsDigest") == incoming_receipts_digest:
+                return cached["commitResponse"]
+            else:
+                raise HTTPException(status_code=409, detail="Commit content conflict")
 
         outcomes = []
         for r in receipts:
@@ -600,7 +580,7 @@ async def handle_mailroom_actions(request: Request):
             prop_digest = r.get("proposalDigest")
             receipt_id = r.get("receiptId")
 
-            key = (eval_id, d_id, c_id)
+            key = make_prop_key(eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
 
             # Strict receipt verification
@@ -631,6 +611,7 @@ async def handle_mailroom_actions(request: Request):
         }
 
         cached["isCompleted"] = True
+        cached["commitReceiptsDigest"] = incoming_receipts_digest
         cached["commitResponse"] = commit_response
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
