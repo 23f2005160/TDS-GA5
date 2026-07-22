@@ -733,29 +733,43 @@ def validate_commit(body):
     input_digest = input_digest.strip()
 
     receipts = body.get("receipts")
-    if not isinstance(receipts, list):
-        raise HTTPException(status_code=422, detail="receipts must be a list")
+    if not isinstance(receipts, list) or not receipts:
+        raise HTTPException(status_code=422, detail="receipts must be a non-empty array")
+    if len(receipts) > MAX_RECEIPTS:
+        raise HTTPException(status_code=422, detail="too many receipts")
+    seen = set()
+    for r in receipts:
+        if not isinstance(r, dict):
+            raise HTTPException(status_code=422, detail="each receipt must be an object")
+        call_id = r.get("callId")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise HTTPException(status_code=422, detail="receipt is missing callId")
+        if not isinstance(r.get("accepted"), bool):
+            raise HTTPException(status_code=422, detail="receipt is missing accepted")
+        if not isinstance(r.get("receiptId"), str) or not r["receiptId"].strip():
+            raise HTTPException(status_code=422, detail="receipt is missing receiptId")
+        if call_id in seen:
+            raise HTTPException(status_code=400, detail="duplicate callId in receipts")
+        seen.add(call_id)
     return eval_id, input_digest, receipts
 
 def bind_receipts(eval_id, receipts, proposals):
     by_call = {p["callId"]: p for p in proposals}
     bound = []
     for r in receipts:
-        if not isinstance(r, dict):
-            raise HTTPException(status_code=409, detail="each receipt must be an object")
-        call_id = r.get("callId", "").strip() if isinstance(r.get("callId"), str) else ""
+        call_id = r["callId"].strip()
         proposal = by_call.get(call_id)
         if proposal is None:
             raise HTTPException(status_code=409, detail="receipt callId %s does not belong to evaluation %s" % (call_id, eval_id))
         if r.get("dossierId") != proposal["dossierId"]:
             raise HTTPException(status_code=409, detail="receipt dossierId does not match proposal %s" % call_id)
         if r.get("action") != proposal["action"]:
-            raise HTTPException(status_code=409, detail="receipt action does not match proposal %s" % call_id)
+            raise HTTPException(status_code=409, detail="receipt dossier action does not match proposal %s" % call_id)
         if r.get("proposalDigest") != proposal_digest(proposal):
             raise HTTPException(status_code=409, detail="receipt proposalDigest does not match proposal %s" % call_id)
         bound.append((r, proposal))
 
-    missing = [c for c in by_call if c not in {r.get("callId", "").strip() for r in receipts if isinstance(r, dict)}]
+    missing = [c for c in by_call if c not in {r["callId"].strip() for r in receipts}]
     if missing:
         raise HTTPException(status_code=409, detail="commit is missing receipts for: %s" % ", ".join(sorted(missing)))
     return bound
