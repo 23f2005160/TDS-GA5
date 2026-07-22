@@ -446,9 +446,9 @@ async def handle_mailroom_actions(request: Request):
         # idempotency / conflict
         if eval_id in Q9_EVALUATIONS:
             cached = Q9_EVALUATIONS[eval_id]
-            if cached["inputDigest"] != input_digest:
+            if cached["inputDigest"] != input_digest or cached.get("isCompleted"):
                 raise HTTPException(status_code=409,
-                                    detail="evaluationId reused with different content")
+                                    detail="evaluationId reused with different content or already completed")
             return cached["proposeResponse"]
 
         results = await asyncio.gather(*[decide(d) for d in dossiers])
@@ -494,6 +494,8 @@ async def handle_mailroom_actions(request: Request):
 
         outcomes = []
         for r in receipts:
+            if not isinstance(r, dict):
+                continue
             d_id = r.get("dossierId")
             c_id = r.get("callId")
             action = r.get("action")
@@ -503,7 +505,11 @@ async def handle_mailroom_actions(request: Request):
 
             key = (eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
-            if not stored:
+
+            # Strict receipt verification: must be stored, have non-empty string receiptId starting with 'rcpt_'
+            valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
+
+            if not stored or not valid_receipt_id:
                 status = "rejected"
             elif stored["proposalDigest"] != prop_digest or stored["action"] != action:
                 status = "rejected"
@@ -516,6 +522,7 @@ async def handle_mailroom_actions(request: Request):
                 "status": status,
             })
 
+        cached["isCompleted"] = True
         return {
             "profile": "ga5-mailroom-action-gate/v2",
             "evaluationId": eval_id,
