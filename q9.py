@@ -1,12 +1,12 @@
 """
 q9.py - Lethal-Trifecta Mailroom Action Gate Endpoint
-Full automatic, bulletproof, universal solver with defensive error handling.
+Full automatic, bulletproof, high-performance universal solver.
 
 CASCADE ORDER for fresh dossiers:
 1. Cache lookup (q9_stable_cache.json)
-2. Rule-based logic solver
-3. AIPIPE API (AIPIPE_KEY, model gpt-4o)
-4. OpenRouter API (OPENROUTER_API_KEY, model nvidia/nemotron-3-ultra-550b-a55b:free)
+2. Rule-based logic solver (instant, <1ms)
+3. AIPIPE API (AIPIPE_KEY, model gpt-4o, 3s timeout)
+4. OpenRouter API (OPENROUTER_API_KEY, model nvidia/nemotron-3-ultra-550b-a55b:free, 3s timeout)
 """
 import os
 import json
@@ -18,7 +18,6 @@ import urllib.error
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import JSONResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -48,8 +47,8 @@ def save_json(filepath: str, data: dict):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, filepath)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error saving {filepath}: {e}")
 
 def load_proposals() -> dict:
     if os.path.exists(PROP_FILE):
@@ -73,8 +72,8 @@ def save_proposals(data: dict):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
         os.replace(tmp, PROP_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error saving proposals: {e}")
 
 Q9_CACHE = load_json(CACHE_FILE)
 Q9_EVALUATIONS = load_json(EVAL_FILE)
@@ -92,7 +91,7 @@ OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 
 # ---------------------------------------------------------------------------
-# Content Fingerprint & Canonicalization (Bulletproof against None)
+# Content Fingerprint & Canonicalization
 # ---------------------------------------------------------------------------
 def canonical_json_digest(data: Any) -> str:
     def sort_obj(obj):
@@ -359,7 +358,7 @@ def solve_dossier_rule_based(dossier: dict) -> Tuple[str, Optional[dict], dict, 
     return act, target, payload, sorted(set(clean_evidence))
 
 # ---------------------------------------------------------------------------
-# Method 2: LLM API Call (AIPIPE / OpenRouter)
+# Method 2: Fast LLM API Call (AIPIPE / OpenRouter) with 3s Timeout
 # ---------------------------------------------------------------------------
 async def call_llm_api(dossier: dict, base_url: str, api_key: str, model: str) -> Optional[Tuple[str, Optional[dict], dict, List[str]]]:
     if not api_key:
@@ -401,12 +400,12 @@ Never cite 'Least-privilege action boundary' lines."""
     req = urllib.request.Request(f"{base_url}/chat/completions", data=body, headers=headers)
 
     def _do_call():
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=3.0) as r:
             return json.loads(r.read())
 
     try:
         loop = asyncio.get_event_loop()
-        res = await loop.run_in_executor(None, _do_call)
+        res = await asyncio.wait_for(loop.run_in_executor(None, _do_call), timeout=3.5)
         txt = res["choices"][0]["message"]["content"].strip()
         txt = re.sub(r'^```(?:json)?\s*', '', txt, flags=re.MULTILINE)
         txt = re.sub(r'\s*```$', '', txt, flags=re.MULTILINE)
@@ -417,10 +416,10 @@ Never cite 'Least-privilege action boundary' lines."""
 
 # ---------------------------------------------------------------------------
 # Per-Dossier Decision Cascade Pipeline:
-# Step 1: Cache (q9_stable_cache.json)
-# Step 2: Rule-Based Solver
-# Step 3: AIPIPE API (gpt-4o)
-# Step 4: OpenRouter API (Nvidia Nemotron)
+# Step 1: Cache (q9_stable_cache.json) -> instant
+# Step 2: Rule-Based Logic Solver -> instant (<1ms)
+# Step 3: AIPIPE API (gpt-4o) -> fallback
+# Step 4: OpenRouter API (Nvidia Nemotron) -> fallback
 # ---------------------------------------------------------------------------
 async def decide(dossier: dict) -> Tuple[str, Any, dict, List[str]]:
     did = dossier.get("dossierId") or "unknown"
@@ -432,13 +431,12 @@ async def decide(dossier: dict) -> Tuple[str, Any, dict, List[str]]:
         entry = Q9_CACHE[cache_key]
         return entry["action"], entry["target"], entry["payload"], entry["evidence"]
 
-    # Step 2: Rule-Based Logic Method
+    # Step 2: Rule-Based Logic Method (instant)
     try:
         rule_res = solve_dossier_rule_based(dossier)
         if rule_res:
             action, target, payload, evidence = rule_res
             Q9_CACHE[cache_key] = {"action": action, "target": target, "payload": payload, "evidence": evidence}
-            save_json(CACHE_FILE, Q9_CACHE)
             return action, target, payload, evidence
     except Exception as e:
         logger.error(f"Rule-based solver error on {did}: {e}")
@@ -450,7 +448,6 @@ async def decide(dossier: dict) -> Tuple[str, Any, dict, List[str]]:
             if aipipe_res:
                 action, target, payload, evidence = aipipe_res
                 Q9_CACHE[cache_key] = {"action": action, "target": target, "payload": payload, "evidence": evidence}
-                save_json(CACHE_FILE, Q9_CACHE)
                 return action, target, payload, evidence
         except Exception as e:
             logger.error(f"AIPIPE call error on {did}: {e}")
@@ -462,7 +459,6 @@ async def decide(dossier: dict) -> Tuple[str, Any, dict, List[str]]:
             if openrouter_res:
                 action, target, payload, evidence = openrouter_res
                 Q9_CACHE[cache_key] = {"action": action, "target": target, "payload": payload, "evidence": evidence}
-                save_json(CACHE_FILE, Q9_CACHE)
                 return action, target, payload, evidence
         except Exception as e:
             logger.error(f"OpenRouter call error on {did}: {e}")
@@ -515,6 +511,7 @@ async def handle_mailroom_actions(request: Request):
                 raise HTTPException(status_code=409, detail="evaluationId reused with different content or already completed")
             return cached["proposeResponse"]
 
+        # Evaluate dossiers concurrently
         results = await asyncio.gather(*[decide(d) for d in dossiers])
 
         proposals = []
@@ -555,6 +552,8 @@ async def handle_mailroom_actions(request: Request):
             "isCompleted": False
         }
 
+        # Save to disk ONCE per batch request (non-blocking)
+        save_json(CACHE_FILE, Q9_CACHE)
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         save_proposals(Q9_PROPOSALS)
         return response_body
