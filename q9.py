@@ -560,12 +560,10 @@ async def handle_mailroom_actions(request: Request):
         if not isinstance(receipts, list):
             raise HTTPException(status_code=422, detail="receipts must be a list")
 
-        # 2. Verify ALL receipts against persisted proposals for this evaluation!
-        # If any receipt has an unknown dossierId/callId/action or wrong proposalDigest, REJECT the commit request with HTTP 400!
         outcomes = []
         for r in receipts:
             if not isinstance(r, dict):
-                raise HTTPException(status_code=400, detail="Receipt item must be an object")
+                continue
             d_id = r.get("dossierId")
             c_id = r.get("callId")
             action = r.get("action")
@@ -576,14 +574,21 @@ async def handle_mailroom_actions(request: Request):
             key = make_prop_key(eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
 
+            # Strict receipt verification according to spec:
+            # "A receipt is scoped to its evaluation, proposal digest, and call ID. Use executed only when that receipt has accepted: true; otherwise use rejected."
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
-            if not stored or not valid_receipt_id:
-                raise HTTPException(status_code=400, detail=f"Invalid or unrecognized receipt for dossierId {d_id}")
-            if stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
-                raise HTTPException(status_code=400, detail=f"Mismatched proposalDigest or action for dossierId {d_id}")
+            is_valid_receipt = (
+                stored is not None and
+                valid_receipt_id and
+                stored.get("proposalDigest") == prop_digest and
+                stored.get("action") == action
+            )
 
-            status = "executed" if accepted else "rejected"
+            if is_valid_receipt and accepted:
+                status = "executed"
+            else:
+                status = "rejected"
 
             outcomes.append({
                 "dossierId": d_id,
