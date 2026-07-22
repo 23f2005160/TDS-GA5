@@ -560,16 +560,7 @@ async def handle_mailroom_actions(request: Request):
         if not isinstance(receipts, list):
             raise HTTPException(status_code=422, detail="receipts must be a list")
 
-        incoming_receipts_digest = canonical_json_digest(receipts)
-
-        # 2. Replay & Conflict Check for Commit
-        if cached.get("isCompleted"):
-            if cached.get("commitReceiptsDigest") == incoming_receipts_digest:
-                return cached["commitResponse"]
-            else:
-                raise HTTPException(status_code=409, detail="Commit content conflict")
-
-        # 3. Verify ALL receipts against persisted proposals for this evaluation!
+        # 2. Verify ALL receipts against persisted proposals for this evaluation!
         # If any receipt has an unknown dossierId/callId/action or wrong proposalDigest, REJECT the commit request with HTTP 400!
         outcomes = []
         for r in receipts:
@@ -612,7 +603,6 @@ async def handle_mailroom_actions(request: Request):
         }
 
         cached["isCompleted"] = True
-        cached["commitReceiptsDigest"] = incoming_receipts_digest
         cached["commitResponse"] = commit_response
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
