@@ -12,6 +12,9 @@ router = APIRouter()
 # Globals and constants
 # ---------------------------------------------------------------------------
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "..", "q9_stable_cache.json")
+EVAL_FILE = os.path.join(os.path.dirname(__file__), "..", "q9_evaluations.json")
+PROP_FILE = os.path.join(os.path.dirname(__file__), "..", "q9_proposals.json")
+
 Q9_CACHE = {}
 Q9_EVALUATIONS = {}
 Q9_PROPOSALS = {}
@@ -32,7 +35,48 @@ def save_cache():
     except Exception:
         pass
 
+def load_evaluations():
+    if os.path.exists(EVAL_FILE):
+        try:
+            with open(EVAL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_evaluations():
+    try:
+        with open(EVAL_FILE, "w", encoding="utf-8") as f:
+            json.dump(Q9_EVALUATIONS, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def load_proposals():
+    if os.path.exists(PROP_FILE):
+        try:
+            with open(PROP_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                res = {}
+                for k, v in data.items():
+                    parts = k.split("|")
+                    if len(parts) == 3:
+                        res[(parts[0], parts[1], parts[2])] = v
+                return res
+        except Exception:
+            pass
+    return {}
+
+def save_proposals():
+    try:
+        data = {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in Q9_PROPOSALS.items()}
+        with open(PROP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
 Q9_CACHE = load_cache()
+Q9_EVALUATIONS = load_evaluations()
+Q9_PROPOSALS = load_proposals()
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL_IDS = [
@@ -478,6 +522,8 @@ async def handle_mailroom_actions(request: Request):
         }
         Q9_EVALUATIONS[eval_id] = {"inputDigest": input_digest,
                                    "proposeResponse": response_body}
+        save_evaluations()
+        save_proposals()
         return response_body
 
     # ---------------- commit ----------------
@@ -523,6 +569,7 @@ async def handle_mailroom_actions(request: Request):
             })
 
         cached["isCompleted"] = True
+        save_evaluations()
         return {
             "profile": "ga5-mailroom-action-gate/v2",
             "evaluationId": eval_id,
