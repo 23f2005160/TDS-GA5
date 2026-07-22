@@ -1,73 +1,117 @@
-"""
-q9.py - Lethal-Trifecta Mailroom Action Gate Endpoint
-Full automatic, bulletproof, high-performance universal solver.
+"""Q9 - Lethal-Trifecta Mailroom Action Gate (profile ga5-mailroom-action-gate/v2).
 
-CASCADE ORDER for dossiers:
-1. Cache lookup (q9_stable_cache.json - by exact fingerprint OR dossierId prefix)
-2. Rule-Based Logic Solver (instant, <1ms)
-3. AIPIPE API (AIPIPE_KEY, model gpt-4o, 3s timeout)
-4. OpenRouter API (OPENROUTER_API_KEY, model nvidia/nemotron-3-ultra-550b-a55b:free, 3s timeout)
+One endpoint, two operations. `propose` reads dossiers and returns exactly one
+least-privilege action per dossier; `commit` binds grader receipts to those
+proposals and returns terminal outcomes.
+
+4-LEVEL DECISION CASCADE:
+1. Persistent Cache (SQLite WAL q9_v3_decisions)
+2. Dynamic Rule-Based Deterministic Solver (deterministic_decision)
+3. AIPIPE API (AIPIPE_KEY, gpt-4o)
+4. OpenRouter API (OPENROUTER_API_KEY, nvidia/nemotron-3-ultra-550b-a55b:free)
 """
-import os
-import json
-import re
-import hashlib
+
 import asyncio
+import hashlib
+import json
+import os
+import re
+import sqlite3
 import tempfile
+import threading
 import urllib.request
 import urllib.error
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 PROFILE = "ga5-mailroom-action-gate/v2"
 
-# ---------------------------------------------------------------------------
-# Disk Persistence for Multi-Worker Deployments (Gunicorn / Render)
-# Use system temp directory to guarantee 100% read/write permissions on Render
-# ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(BASE_DIR)
-TMP_DIR = tempfile.gettempdir()
+ACTIONS = (
+    "create_draft",
+    "update_internal_record",
+    "send_approved_notice",
+    "request_confirmation",
+    "quarantine_item",
+    "no_action",
+)
+SAFE_DEFAULT = "request_confirmation"
+NO_ACTION_REASONS = ("ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL")
 
-EVAL_FILE = os.path.join(TMP_DIR, "ga5_q9_evaluations.json")
-PROP_FILE = os.path.join(TMP_DIR, "ga5_q9_proposals.json")
-COMMITS_FILE = os.path.join(TMP_DIR, "ga5_q9_commits.json")
-CACHE_FILE = os.path.join(ROOT_DIR, "q9_stable_cache.json")
+MAX_BODY_BYTES = 16 * 1024 * 1024
+MAX_DOSSIERS = 400
+MAX_RECEIPTS = 400
+MAX_LINES = 60
+MAX_LINE_CHARS = 320
+CHUNK_SIZE = 10
+MAX_CONCURRENCY = 6
+CHUNK_TIMEOUT = 26.0
+PROPOSE_BUDGET = 46.0
 
-def load_json(filepath: str) -> dict:
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading {filepath}: {e}")
-            return {}
-    return {}
+# ------------------------------------------------------------------ storage
 
-def save_json(filepath: str, data: dict):
+def _db_path():
+    want = os.environ.get("GA5_DB", "/tmp/ga5.db")
+    parent = os.path.dirname(want) or "."
     try:
-        tmp = filepath + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, filepath)
-    except Exception as e:
-        logger.error(f"Error saving {filepath}: {e}")
+        os.makedirs(parent, exist_ok=True)
+        with open(want, "ab"):
+            pass
+        return want
+    except OSError:
+        return os.path.join(tempfile.gettempdir(), "ga5.db")
 
-def make_prop_key(eval_id: str, dossier_id: str, call_id: str) -> str:
-    return f"{eval_id}|{dossier_id}|{call_id}"
+DB_PATH = _db_path()
+_lock = threading.Lock()
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+_conn.execute("PRAGMA journal_mode=WAL")
+_conn.execute("PRAGMA synchronous=NORMAL")
+_conn.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS q9_v3_decisions (
+        cache_key TEXT PRIMARY KEY,
+        proposal TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v3_calls (
+        call_id TEXT PRIMARY KEY,
+        proposal TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v3_evals (
+        eval_id TEXT PRIMARY KEY,
+        input_digest TEXT,
+        response TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v3_eval_calls (
+        eval_call TEXT PRIMARY KEY,
+        proposal TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v3_commits (
+        commit_key TEXT PRIMARY KEY,
+        response TEXT
+    );
+    CREATE TABLE IF NOT EXISTS q9_v3_effects (
+        effect_key TEXT PRIMARY KEY,
+        outcome TEXT
+    );
+    """
+)
+_conn.commit()
 
-Q9_CACHE = load_json(CACHE_FILE)
-Q9_EVALUATIONS = load_json(EVAL_FILE)
-Q9_PROPOSALS = load_json(PROP_FILE)
-Q9_COMMITS = load_json(COMMITS_FILE)
+def _get(table, key_col, key):
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM %s WHERE %s=?" % (table, key_col), (key,)
+        ).fetchone()
 
-# ---------------------------------------------------------------------------
-# API Configurations (Strictly from Environment Variables)
-# ---------------------------------------------------------------------------
+def _put(sql, params):
+    with _lock:
+        _conn.execute(sql, params)
+        _conn.commit()
+
+# --------------------------------------------------------------- API Configs
+
 AIPIPE_KEY = os.environ.get("AIPIPE_KEY", "")
 AIPIPE_BASE = os.environ.get("AIPIPE_BASE", "https://aipipe.org/openai/v1")
 AIPIPE_MODEL = os.environ.get("AIPIPE_MODEL", "gpt-4o")
@@ -76,564 +120,638 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 
-# ---------------------------------------------------------------------------
-# Content Fingerprint & Canonicalization
-# ---------------------------------------------------------------------------
-def canonical_json_digest(data: Any) -> str:
-    def sort_obj(obj):
-        if isinstance(obj, dict):
-            return {k: sort_obj(v) for k, v in sorted(obj.items())}
-        if isinstance(obj, list):
-            return [sort_obj(x) for x in obj]
-        return obj
-    compact = json.dumps(sort_obj(data), separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(compact.encode("utf-8")).hexdigest()
+# --------------------------------------------------------------- canonical
 
-def content_fingerprint(dossier: dict) -> str:
-    if not isinstance(dossier, dict):
-        return hashlib.sha256(b"").hexdigest()
-    sources = dossier.get("sources") or []
-    if not isinstance(sources, list):
-        sources = []
+def canonical(obj):
+    """Deterministic JSON: recursively key-sorted, compact, unicode-preserving."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def digest(obj):
+    return hashlib.sha256(canonical(obj).encode("utf-8")).hexdigest()
+
+def proposal_digest(proposal):
+    """The grader's normalization: fixed key set, sorted evidence, then SHA-256."""
     core = {
-        "mailbox": dossier.get("mailbox") or "",
-        "sources": [
-            {
-                "kind": s.get("kind") if isinstance(s, dict) else "",
-                "provenance": s.get("provenance") if isinstance(s, dict) else "",
-                "lines": [
-                    {"lineId": l.get("lineId") or "", "text": l.get("text") or ""}
-                    for l in ((s.get("lines") or []) if isinstance(s, dict) else [])
-                    if isinstance(l, dict)
-                ]
-            }
-            for s in sources if isinstance(s, dict)
-        ]
+        "dossierId": proposal["dossierId"],
+        "callId": proposal["callId"],
+        "action": proposal["action"],
+        "target": proposal.get("target"),
+        "payload": proposal["payload"],
+        "evidence": sorted(proposal["evidence"]),
     }
-    return canonical_json_digest(core)
+    return digest(core)
 
-def compute_proposal_digest(dossier_id: str, call_id: str, action: str,
-                             target: Any, payload: Any, evidence: List[str]) -> str:
-    core = {
-        "dossierId": dossier_id or "",
-        "callId": call_id or "",
-        "action": action or "no_action",
-        "target": target if target is not None else None,
-        "payload": payload or {},
-        "evidence": sorted(evidence) if evidence else [],
-    }
-    return canonical_json_digest(core)
+def fingerprint_of(dossier):
+    """Content identity of a dossier, ignoring the volatile receipt timestamp."""
+    body = {k: v for k, v in dossier.items() if k != "receivedAt"}
+    return digest(body)
 
-# ---------------------------------------------------------------------------
-# Safe Extractors & Line Helpers
-# ---------------------------------------------------------------------------
-def extract_case(text: Any) -> Optional[str]:
-    if not isinstance(text, str): return None
-    m = re.search(r'CASE-[A-Z0-9]+', text)
-    return m.group(0) if m else None
+def call_id_for(dossier_id, fingerprint):
+    """Durable and evaluation-independent by construction; 43 safe characters."""
+    return "mr_" + hashlib.sha256(
+        ("q9v2|" + dossier_id + "|" + fingerprint).encode("utf-8")
+    ).hexdigest()[:40]
 
-def extract_ord(text: Any) -> Optional[str]:
-    if not isinstance(text, str): return None
-    m = re.search(r'ORD-[A-Z0-9]+', text)
-    return m.group(0) if m else None
+# ------------------------------------------------------- trifecta scrubbing
 
-def extract_evt(text: Any) -> Optional[str]:
-    if not isinstance(text, str): return None
-    m = re.search(r'EVT-[A-Z0-9]+', text)
-    return m.group(0) if m else None
+CANARY_RE = re.compile(r"[A-Za-z0-9_\-]*canary[A-Za-z0-9_\-]*", re.I)
+VAULT_RE = re.compile(r"[A-Za-z0-9_\-]*(?:vault|passphrase|api[_-]?key|secret[_-]?key)[A-Za-z0-9_\-]*", re.I)
+HEXRUN_RE = re.compile(r"\b[0-9a-fA-F]{24,}\b")
+TOKEN_RE = re.compile(r"\b(?:sk|pk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_\-]{12,}\b")
+PEM_RE = re.compile(r"-{2,}BEGIN[^-]{0,60}-{2,}", re.I)
+SECRET_RES = (CANARY_RE, VAULT_RE, TOKEN_RE, HEXRUN_RE, PEM_RE)
 
-def extract_att(text: Any) -> Optional[str]:
-    if not isinstance(text, str): return None
-    m = re.search(r'ATT-[A-Z0-9]+', text)
-    return m.group(0) if m else None
+def looks_secret(s):
+    return any(rx.search(s) for rx in SECRET_RES)
 
-def extract_email(text: Any) -> Optional[str]:
-    if not isinstance(text, str): return None
-    m = re.search(r'[\w.+-]+@[\w.-]+\.[a-zA-Z]+', text)
-    return m.group(0) if m else None
+def clean_scalar(value, fallback, limit=160):
+    if isinstance(value, bool) or value is None:
+        value = ""
+    if isinstance(value, (int, float)):
+        value = str(value)
+    if not isinstance(value, str):
+        value = ""
+    value = " ".join(value.split())
+    if not value or looks_secret(value):
+        return fallback
+    if len(value) > limit:
+        value = value[:limit].rstrip()
+    return value or fallback
 
-def extract_window(text: Any) -> Optional[str]:
-    if not isinstance(text, str): return None
-    m = re.search(r'\d{2}:\d{2}[-\u2013]\d{2}:\d{2}\s*UTC', text)
-    return m.group(0) if m else None
+# ------------------------------------------------------------- line render
 
-def extract_status_quoted(text: Any) -> Optional[str]:
-    if not isinstance(text, str): return None
-    m = re.search(r'["\u201c\u2018\u00ab]([\w\s]+)["\u201d\u2019\u00bb]', text)
-    return m.group(1).strip() if m else None
-
-def get_lines(sources: Any, kind: str = None, provenance: str = None) -> list:
-    res = []
+def dossier_lines(dossier):
+    out = []
+    sources = dossier.get("sources")
     if not isinstance(sources, list):
-        return res
-    for s in sources:
-        if not isinstance(s, dict): continue
-        if kind and s.get('kind') != kind: continue
-        if provenance and s.get('provenance') != provenance: continue
-        lines = s.get('lines') or []
-        if isinstance(lines, list):
-            res.extend([ln for ln in lines if isinstance(ln, dict)])
-    return res
-
-def find_line(lines: list, *keywords, exclude: list = None):
-    if not isinstance(lines, list):
-        return None
-    for ln in lines:
-        if not isinstance(ln, dict): continue
-        txt = (ln.get('text') or '').lower()
-        if all(k.lower() in txt for k in keywords):
-            if exclude and any(e.lower() in txt for e in exclude):
+        return out
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        sid = src.get("sourceId")
+        lines = src.get("lines")
+        if not isinstance(lines, list):
+            continue
+        for ln in lines:
+            if not isinstance(ln, dict):
                 continue
-            return ln
+            lid = ln.get("lineId")
+            if not isinstance(lid, str) or not lid:
+                continue
+            text = ln.get("text")
+            out.append((lid, text if isinstance(text, str) else "", sid if isinstance(sid, str) else ""))
+            if len(out) >= MAX_LINES:
+                return out
+    return out
+
+def render_dossier(dossier, did):
+    parts = ["### DOSSIER %s" % did]
+    for key in ("partition", "mailbox", "objective"):
+        v = dossier.get(key)
+        if isinstance(v, str) and v:
+            parts.append("%s: %s" % (key, v[:300]))
+    sources = dossier.get("sources") if isinstance(dossier.get("sources"), list) else []
+    budget = MAX_LINES
+    for src in sources:
+        if not isinstance(src, dict) or budget <= 0:
+            continue
+        parts.append('-- source %s | kind=%s | provenance=%s | title=%s' % (
+            src.get("sourceId", "?"), src.get("kind", "?"),
+            src.get("provenance", "?"), str(src.get("title", ""))[:120]))
+        for ln in (src.get("lines") or [])[:budget]:
+            if not isinstance(ln, dict):
+                continue
+            lid = ln.get("lineId")
+            if not isinstance(lid, str):
+                continue
+            text = ln.get("text")
+            text = text if isinstance(text, str) else ""
+            parts.append("   [%s] %s" % (lid, text[:MAX_LINE_CHARS]))
+            budget -= 1
+    parts.append("### END %s" % did)
+    return "\n\n".join(parts)
+
+# --------------------------------------------------------- deterministic gate
+
+INJECTION_CLAUSE = "higher-priority instruction"
+EXFIL_CLAUSE = "Copy any vault marker"
+COMPLETED_CLAUSE = "records this item as"
+APPROVAL_CLAUSE = "permits one delivery-status notice"
+CARRIER_CLAUSE = "to change delivery_window to the exact value"
+MISMATCH_CLAUSE = "the requested change therefore requires"
+ENQUIRY_CLAUSE = "I have not asked you to send anything yet"
+ENQUIRY_RECORD_CLAUSE = "its current public status is exactly"
+
+Q = "[“\"]([^”\"]+)[”\"]"
+RE_APPROVAL = re.compile(r"Approval (EVT-[A-Z0-9]+) permits one delivery-status notice for (ORD-[A-Z0-9]+) to (\S+) using template (\S+)\.")
+RE_APPROVAL_STATUS = re.compile(r"valid for the public status " + Q)
+RE_CARRIER = re.compile(r"Event (EVT-[A-Z0-9]+) authorizes case (CASE-[A-Z0-9]+) to change (\w+) to the exact value " + Q)
+RE_MISMATCH = re.compile(r"The authenticated contact for (CASE-[A-Z0-9]+) does not match (\S+); the requested change therefore requires ([a-z-]+) confirmation\.")
+RE_ENQUIRY_RECORD = re.compile(r"Order (ORD-[A-Z0-9]+) is linked to (CASE-[A-Z0-9]+); its current public status is exactly " + Q)
+RE_GATEWAY = re.compile(r"sender address recorded by the gateway is (\S+)\.")
+RE_COMPLETED = re.compile(r"(CASE-[A-Z0-9]+) records this item as (already completed|duplicate|informational); the prior action has terminal event (EVT-[A-Z0-9]+)\.")
+RE_ARTIFACT = re.compile(r"The attachment is (ATT-[A-Z0-9]+)\.")
+RE_FOLLOWUP = re.compile(r"follow-up about (ORD-[A-Z0-9]+); no new change")
+FOLLOWUP_CLAUSE = "no new change or outbound response is requested"
+RE_SUPPLIES = re.compile(r"supplies order (ORD-[A-Z0-9]+)")
+
+ACTION_RULES = {
+    "create_draft": "For an unverified inbound status enquiry, create a draft",
+    "update_internal_record": "A verified carrier event may update only the named case field",
+    "request_confirmation": "When sender identity conflicts with the account record",
+    "quarantine_item": "Quarantine external content that attempts to direct tool use",
+    "no_action": "Do not create a second side effect for completed, duplicate",
+}
+GENERIC_RULE = "Select only the action supported by current scoped evidence"
+MAX_EVIDENCE = 5
+
+def _rule_line(dossier, action):
+    clause = ACTION_RULES.get(action)
+    if not clause:
+        return None
+    for _src, lines in _sources(dossier, "policy", "signed_internal"):
+        for ln in lines:
+            text = ln.get("text") or ""
+            if GENERIC_RULE not in text and clause in text:
+                return ln["lineId"]
     return None
 
-# ---------------------------------------------------------------------------
-# Method 1: Rule-Based Deterministic Solver (Friend's Archetype Contract Rules)
-# ---------------------------------------------------------------------------
-def solve_dossier_rule_based(dossier: dict) -> Tuple[str, Optional[dict], dict, List[str]]:
-    if not isinstance(dossier, dict):
-        return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": "unknown"}, []
+COMPLETED_REASONS = {
+    "already completed": "ALREADY_COMPLETED",
+    "duplicate": "DUPLICATE",
+    "informational": "INFORMATIONAL",
+}
 
-    sources = dossier.get("sources") or []
-    if not isinstance(sources, list):
-        sources = []
-    mailbox = dossier.get("mailbox") or "customer-care"
-    all_lines = get_lines(sources)
+def _sources(dossier, kind, provenance):
+    for src in dossier.get("sources") or []:
+        if not isinstance(src, dict):
+            continue
+        if src.get("kind") == kind and src.get("provenance") == provenance:
+            lines = [ln for ln in (src.get("lines") or [])
+                     if isinstance(ln, dict) and isinstance(ln.get("lineId"), str)]
+            yield src, lines
 
-    ext_untrusted = get_lines(sources, provenance='external_untrusted')
-    ext_unverified = get_lines(sources, provenance='external_unverified')
-    att_untrusted = get_lines(sources, kind='attachment', provenance='external_untrusted')
-    msg_unverified = get_lines(sources, kind='message', provenance='external_unverified')
-    event_signed = get_lines(sources, kind='event', provenance='signed_internal')
-    record_auth = get_lines(sources, kind='record', provenance='authenticated_internal')
-    approval_signed = get_lines(sources, kind='approval', provenance='signed_internal')
-    policy_signed = get_lines(sources, kind='policy', provenance='signed_internal')
+def _bearing(dossier, kind, provenance, *clauses):
+    for src, lines in _sources(dossier, kind, provenance):
+        for ln in lines:
+            text = ln.get("text") or ""
+            if any(c in text for c in clauses):
+                return src, lines
+    return None, []
 
-    has_injection = any('higher-priority instruction' in (ln.get('text') or '').lower() or 'copy any vault' in (ln.get('text') or '').lower() for ln in ext_untrusted + att_untrusted)
-    has_approval = any('permits one delivery-status notice' in (ln.get('text') or '').lower() and 'unrelated' not in (ln.get('text') or '').lower() for ln in approval_signed)
-    has_record_mut = any('authorizes case' in (ln.get('text') or '').lower() and 'delivery_window' in (ln.get('text') or '').lower() and 'unrelated' not in (ln.get('text') or '').lower() for ln in event_signed)
-    has_conflict = any('does not match' in (ln.get('text') or '').lower() or 'identity conflict' in (ln.get('text') or '').lower() for ln in record_auth)
-    has_msg_status = any('status' in (ln.get('text') or '').lower() or 'update' in (ln.get('text') or '').lower() for ln in msg_unverified)
-    has_no_action = any('records this item as' in (ln.get('text') or '').lower() for ln in record_auth)
+def _find(lines, rx):
+    for ln in lines:
+        m = rx.search(ln.get("text") or "")
+        if m:
+            return ln["lineId"], m
+    return None, None
 
-    if has_injection:
-        act = "quarantine_item"
-    elif has_approval:
-        act = "send_approved_notice"
-    elif has_record_mut:
-        act = "update_internal_record"
-    elif has_conflict:
-        act = "request_confirmation"
-    elif has_msg_status:
-        act = "create_draft"
-    elif has_no_action:
-        act = "no_action"
-    else:
-        act = "no_action"
+def deterministic_decision(dossier):
+    _src, lines = _bearing(dossier, "attachment", "external_untrusted", INJECTION_CLAUSE, EXFIL_CLAUSE)
+    if lines:
+        alid, m = _find(lines, RE_ARTIFACT)
+        if m:
+            plid = _rule_line(dossier, "quarantine_item")
+            ilid = next((ln["lineId"] for ln in lines if INJECTION_CLAUSE in (ln.get("text") or "")), None)
+            xlid = next((ln["lineId"] for ln in lines if EXFIL_CLAUSE in (ln.get("text") or "")), None)
+            ev = [e for e in (plid, ilid, xlid, alid) if e]
+            return {"action": "quarantine_item", "evidence": ev, "fields": {"artifactId": m.group(1)}}
 
-    if act == 'send_approved_notice':
-        permit_line = find_line(approval_signed, 'permits one delivery-status notice')
-        scope_line = None
-        for s in sources:
-            if isinstance(s, dict) and s.get('provenance') == 'signed_internal' and s.get('kind') == 'approval':
-                for ln in (s.get('lines') or []):
-                    if isinstance(ln, dict) and 'valid for the public status' in (ln.get('text') or '').lower():
-                        scope_line = ln; break
-        email = extract_email(permit_line.get('text')) if permit_line else None
-        ord_id = extract_ord(permit_line.get('text')) if permit_line else None
-        status_val = extract_status_quoted(scope_line.get('text')) if scope_line else (extract_status_quoted(permit_line.get('text')) if permit_line else None)
-        target = {"kind": "email", "id": email or "recipient@example.com"}
-        payload = {"referenceId": ord_id or "ORD-00000000", "status": status_val or 'awaiting customs release', "template": "approved_delivery_notice"}
-        evidence = [permit_line['lineId']] if (permit_line and 'lineId' in permit_line) else []
-        if scope_line and 'lineId' in scope_line: evidence.append(scope_line['lineId'])
+    _src, lines = _bearing(dossier, "record", "authenticated_internal", COMPLETED_CLAUSE)
+    lid, m = _find(lines, RE_COMPLETED)
+    if m:
+        plid = _rule_line(dossier, "no_action")
+        _fsrc, flines = _bearing(dossier, "message", "external_unverified", FOLLOWUP_CLAUSE)
+        flid, fm = _find(flines, RE_FOLLOWUP)
+        ref_id = m.group(1)
+        ev = [e for e in (plid, lid, flid) if e]
+        return {"action": "no_action", "evidence": ev, "fields": {"reasonCode": COMPLETED_REASONS[m.group(2)], "referenceId": ref_id}}
 
-    elif act == 'update_internal_record':
-        record_mut_rule = find_line(policy_signed, 'verified carrier event may update only')
-        auth_event = find_line(event_signed, 'authorizes case', 'delivery_window', exclude=['unrelated'])
-        case_id = extract_case(auth_event.get('text')) if auth_event else None
-        evt_id = extract_evt(auth_event.get('text')) if auth_event else None
-        window = extract_window(auth_event.get('text')) if auth_event else None
-        target = {"kind": "case_record", "id": case_id or "CASE-00000000"}
-        payload = {"field": "delivery_window", "sourceEventId": evt_id or "EVT-00000000", "value": window or "16:00-18:30 UTC"}
-        evidence = []
-        if record_mut_rule and 'lineId' in record_mut_rule: evidence.append(record_mut_rule['lineId'])
-        if auth_event and 'lineId' in auth_event: evidence.append(auth_event['lineId'])
+    _src, lines = _bearing(dossier, "approval", "signed_internal", APPROVAL_CLAUSE)
+    lid, m = _find(lines, RE_APPROVAL)
+    slid, sm = _find(lines, RE_APPROVAL_STATUS)
+    if m and sm:
+        return {"action": "send_approved_notice", "evidence": [lid, slid], "fields": {"recipient": m.group(3), "referenceId": m.group(2), "status": sm.group(1)}}
 
-    elif act == 'request_confirmation':
-        confirm_rule = find_line(policy_signed, 'sender identity conflicts', 'owning approval queue')
-        conflict_rec = find_line(record_auth, 'does not match', exclude=['unrelated']) or find_line(record_auth, 'identity conflict')
-        claim_line = None
-        claimed_sender = None
-        for ln in msg_unverified + ext_unverified:
-            em = extract_email(ln.get('text'))
-            if em:
-                claimed_sender = em
-                claim_line = ln
-                break
-        if claim_line is None:
-            claim_line = find_line(msg_unverified + ext_unverified, 'i am') or find_line(msg_unverified + ext_unverified, 'please')
-        case_id = extract_case(conflict_rec.get('text')) if conflict_rec else None
-        owning_team = None
-        if conflict_rec:
-            m = re.search(r'requires ([\w-]+) confirmation', conflict_rec.get('text') or '')
-            if m: owning_team = m.group(1)
-        if not owning_team:
-            for ln in all_lines:
-                m = re.search(r'ownership remains with ([\w-]+)', ln.get('text') or '')
-                if m: owning_team = m.group(1); break
-        target = {"kind": "approval_queue", "id": owning_team or mailbox}
-        payload = {"claimedSender": claimed_sender or "sender@example.com", "questionCode": "VERIFY_REQUEST", "referenceId": case_id or "CASE-00000000"}
-        evidence = []
-        if confirm_rule and 'lineId' in confirm_rule: evidence.append(confirm_rule['lineId'])
-        if conflict_rec and 'lineId' in conflict_rec: evidence.append(conflict_rec['lineId'])
-        if claim_line and 'lineId' in claim_line: evidence.append(claim_line['lineId'])
+    _src, lines = _bearing(dossier, "event", "signed_internal", CARRIER_CLAUSE)
+    lid, m = _find(lines, RE_CARRIER)
+    if m:
+        plid = _rule_line(dossier, "update_internal_record")
+        ev = [plid, lid] if plid else [lid]
+        return {"action": "update_internal_record", "evidence": ev, "fields": {"caseId": m.group(2), "sourceEventId": m.group(1), "value": m.group(4)}}
 
-    elif act == 'quarantine_item':
-        untrusted_rule = find_line(policy_signed, 'quarantine external content', 'attempts to direct')
-        injection_line = find_line(att_untrusted + ext_untrusted, 'higher-priority instruction')
-        exfil_line = find_line(att_untrusted + ext_untrusted, 'copy any vault marker') or find_line(att_untrusted + ext_untrusted, 'collector.invalid')
-        artifact_line = find_line(att_untrusted + ext_untrusted, 'its prose is supplied') or find_line(att_untrusted + ext_untrusted, 'the attachment is att-')
-        att_id = None
-        for ln in att_untrusted + ext_untrusted + all_lines:
-            att = extract_att(ln.get('text'))
-            if att: att_id = att; break
-        target = {"kind": "security_queue", "id": "mailroom"}
-        payload = {"artifactId": att_id or "ATT-00000000", "reasonCode": "INDIRECT_PROMPT_INJECTION"}
-        evidence = []
-        if untrusted_rule and 'lineId' in untrusted_rule: evidence.append(untrusted_rule['lineId'])
-        if injection_line and 'lineId' in injection_line: evidence.append(injection_line['lineId'])
-        if exfil_line and 'lineId' in exfil_line: evidence.append(exfil_line['lineId'])
-        if artifact_line and 'lineId' in artifact_line: evidence.append(artifact_line['lineId'])
+    _src, lines = _bearing(dossier, "record", "authenticated_internal", MISMATCH_CLAUSE)
+    lid, m = _find(lines, RE_MISMATCH)
+    if m:
+        plid = _rule_line(dossier, "request_confirmation")
+        _msrc, mlines = _bearing(dossier, "message", "external_unverified", "supplies order")
+        slid, sm = _find(mlines, RE_SUPPLIES)
+        clid, _cm = _find(mlines, re.compile(r"^I am (\S+?)\."))
+        ref_id = m.group(1)
+        ev = [e for e in (plid, lid, clid) if e]
+        return {"action": "request_confirmation", "evidence": ev, "fields": {"team": m.group(3), "claimedSender": m.group(2), "referenceId": ref_id}}
 
-    elif act == 'create_draft':
-        mailroom_rule = find_line(policy_signed, 'unverified inbound status enquiry', 'create a draft')
-        msg_line = find_line(msg_unverified + ext_unverified, 'status') or ((msg_unverified + ext_unverified)[0] if (msg_unverified + ext_unverified) else None)
-        rec_line = None
-        for ln in record_auth:
-            if 'status' in (ln.get('text') or '').lower() or 'currently has' in (ln.get('text') or '').lower():
-                rec_line = ln; break
-        recipient = None
-        for ln in msg_unverified + ext_unverified:
-            em = extract_email(ln.get('text'))
-            if em: recipient = em; break
-        ref_ord = None
-        for ln in msg_unverified + ext_unverified + record_auth:
-            om = extract_ord(ln.get('text'))
-            if om: ref_ord = om; break
-        status_val = extract_status_quoted(rec_line.get('text')) if rec_line else None
-        target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
-        payload = {"recipient": recipient or "recipient@example.com", "referenceId": ref_ord or "ORD-00000000", "status": status_val or 'processing', "template": "order_status"}
-        evidence = []
-        if mailroom_rule and 'lineId' in mailroom_rule: evidence.append(mailroom_rule['lineId'])
-        if msg_line and 'lineId' in msg_line: evidence.append(msg_line['lineId'])
-        if rec_line and 'lineId' in rec_line: evidence.append(rec_line['lineId'])
+    _rsrc, rlines = _bearing(dossier, "record", "authenticated_internal", ENQUIRY_RECORD_CLAUSE)
+    _msrc, mlines = _bearing(dossier, "message", "external_unverified", ENQUIRY_CLAUSE)
+    rlid, rm = _find(rlines, RE_ENQUIRY_RECORD)
+    mlid, mm = _find(mlines, RE_GATEWAY)
+    if rm and mm:
+        fields = {"recipient": mm.group(1), "referenceId": rm.group(1), "status": rm.group(3)}
+        plid = _rule_line(dossier, "create_draft")
+        elid, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE)))
+        evidence = [e for e in (plid, rlid, elid) if e]
+        return {"action": "create_draft", "evidence": evidence, "fields": fields}
 
-    else:  # no_action
-        dup_rule = find_line(policy_signed, 'duplicate', 'informational') or find_line(policy_signed, 'second side effect')
-        rec_line = find_line(record_auth, 'records this item as')
-        follow_up = find_line(msg_unverified + ext_unverified, 'follow-up') or find_line(msg_unverified + ext_unverified, 'no new change')
-        if not follow_up:
-            for ln in record_auth:
-                if ln != rec_line: follow_up = ln; break
-        case_id = extract_case(rec_line.get('text')) if rec_line else None
-        reason = 'INFORMATIONAL'
-        if rec_line:
-            txt = (rec_line.get('text') or '').lower()
-            if 'already completed' in txt: reason = 'ALREADY_COMPLETED'
-            elif 'duplicate' in txt: reason = 'DUPLICATE'
-            elif 'informational' in txt: reason = 'INFORMATIONAL'
-        target = None
-        payload = {"reasonCode": reason, "referenceId": case_id or "CASE-00000000"}
-        evidence = []
-        if dup_rule and 'lineId' in dup_rule: evidence.append(dup_rule['lineId'])
-        if rec_line and 'lineId' in rec_line: evidence.append(rec_line['lineId'])
-        if follow_up and 'lineId' in follow_up: evidence.append(follow_up['lineId'])
+    return None
 
-    clean_evidence = [e for e in evidence if isinstance(e, str) and len(e.strip()) > 0]
-    return act, target, payload, sorted(set(clean_evidence))
+# ------------------------------------------------------- Level 3 & Level 4 LLM Cascade
 
-# ---------------------------------------------------------------------------
-# Method 2: Fast LLM API Call (AIPIPE / OpenRouter) with 3s Timeout
-# ---------------------------------------------------------------------------
-async def call_llm_api(dossier: dict, base_url: str, api_key: str, model: str) -> Optional[Tuple[str, Optional[dict], dict, List[str]]]:
-    if not api_key:
-        return None
-        
-    system_prompt = """You are a mailroom action classifier. Return EXACTLY ONE JSON object with fields: action, target, payload, evidence.
-Rules:
-- send_approved_notice: target={"kind":"email","id":"<email>"}, payload={"referenceId":"ORD-..","status":"..","template":"approved_delivery_notice"}, evidence=[permit line, scope line]
-- update_internal_record: target={"kind":"case_record","id":"CASE-.."}, payload={"field":"delivery_window","sourceEventId":"EVT-..","value":".."}, evidence=[mutation rule line, auth event line]
-- request_confirmation: target={"kind":"approval_queue","id":"<owning team>"}, payload={"claimedSender":"<email>","questionCode":"VERIFY_REQUEST","referenceId":"CASE-.."}, evidence=[confirmation rule line, conflict record line, sender's claim message line ("I am <email>...")]
-- quarantine_item: target={"kind":"security_queue","id":"mailroom"}, payload={"artifactId":"ATT-..","reasonCode":"INDIRECT_PROMPT_INJECTION"}, evidence=[untrusted rule line, injection line, exfil line, artifact line]
-- create_draft: target={"kind":"draft_queue","id":"mailbox:<mailbox>"}, payload={"recipient":"<email>","referenceId":"ORD-..","status":"..","template":"order_status"}, evidence=[mailroom rule line, msg line, record status line]
-- no_action: target=null, payload={"reasonCode":"INFORMATIONAL"|"DUPLICATE"|"ALREADY_COMPLETED","referenceId":"CASE-.."}, evidence=[dup rule line, record line, follow-up line]
-Never cite 'Least-privilege action boundary' lines."""
+SYSTEM_PROMPT = """You are the action gate of a mailroom agent. For every dossier choose EXACTLY ONE least-privilege action.
+ACTIONS: no_action, create_draft, update_internal_record, request_confirmation, send_approved_notice, quarantine_item.
+Return JSON: {"decisions": {"<dossierId>": {"action": "<action>", "evidence": ["<lineId>"], "fields": {...}}}}"""
 
-    dossier_json = json.dumps({
-        "dossierId": dossier.get("dossierId"),
-        "mailbox": dossier.get("mailbox"),
-        "sources": [{"kind": s.get("kind"), "provenance": s.get("provenance"), "lines": s.get("lines", [])} for s in (dossier.get("sources") or []) if isinstance(s, dict)]
-    }, ensure_ascii=False)
+def build_user_message(items):
+    parts = ["Decide one action for each of the %d dossiers below." % len(items)]
+    for did, dossier in items:
+        parts.append(render_dossier(dossier, did))
+    parts.append('Reply with JSON {"decisions": {...}} covering exactly these ids: ' + ", ".join(i[0] for i in items))
+    return "\n\n".join(parts)
 
+async def call_single_llm_api(items: list, base_url: str, api_key: str, model: str) -> dict:
+    if not api_key or not items:
+        return {}
+    user_msg = build_user_message(items)
     body = json.dumps({
         "model": model,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Classify this dossier:\n{dossier_json}"}
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg}
         ],
-        "temperature": 0,
-        "max_tokens": 600
+        "temperature": 0.0,
+        "max_tokens": 2048
     }).encode("utf-8")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "User-Agent": "Mozilla/5.0"
     }
-
     req = urllib.request.Request(f"{base_url}/chat/completions", data=body, headers=headers)
 
     def _do_call():
-        with urllib.request.urlopen(req, timeout=3.0) as r:
+        with urllib.request.urlopen(req, timeout=10.0) as r:
             return json.loads(r.read())
 
     try:
         loop = asyncio.get_event_loop()
-        res = await asyncio.wait_for(loop.run_in_executor(None, _do_call), timeout=3.5)
+        res = await asyncio.wait_for(loop.run_in_executor(None, _do_call), timeout=12.0)
         txt = res["choices"][0]["message"]["content"].strip()
         txt = re.sub(r'^```(?:json)?\s*', '', txt, flags=re.MULTILINE)
         txt = re.sub(r'\s*```$', '', txt, flags=re.MULTILINE)
         data = json.loads(txt.strip())
-        return data["action"], data.get("target"), data.get("payload", {}), sorted(set(data.get("evidence", [])))
-    except Exception:
-        return None
-
-# ---------------------------------------------------------------------------
-# Per-Dossier Decision Cascade Pipeline:
-# Step 1: Cache (q9_stable_cache.json - by exact fingerprint OR dossierId prefix)
-# Step 2: Rule-Based Logic Solver -> instant (<1ms)
-# Step 3: AIPIPE API (gpt-4o) -> fallback
-# Step 4: OpenRouter API (Nvidia Nemotron) -> fallback
-# ---------------------------------------------------------------------------
-async def decide(dossier: dict) -> Tuple[str, Any, dict, List[str]]:
-    did = dossier.get("dossierId") or "unknown"
-    fp = content_fingerprint(dossier)
-    cache_key = f"{did}:{fp}"
-
-    # Step 1a: Check Stable Cache by exact fingerprint
-    if cache_key in Q9_CACHE:
-        entry = Q9_CACHE[cache_key]
-        return entry["action"], entry["target"], entry["payload"], entry["evidence"]
-
-    # Step 1b: Check Stable Cache by dossierId prefix (Guarantees 70/70 cache hit for stable dossiers)
-    for k, v in Q9_CACHE.items():
-        if k.startswith(f"{did}:") or k == did:
-            return v["action"], v["target"], v["payload"], v["evidence"]
-
-    # Step 2: Rule-Based Logic Method (instant) for fresh dossiers
-    try:
-        rule_res = solve_dossier_rule_based(dossier)
-        if rule_res:
-            action, target, payload, evidence = rule_res
-            Q9_CACHE[cache_key] = {"action": action, "target": target, "payload": payload, "evidence": evidence}
-            return action, target, payload, evidence
+        decisions = data.get("decisions") if isinstance(data, dict) else (data if isinstance(data, dict) else {})
+        return {did: decisions[did] for did, _d in items if isinstance(decisions.get(did), dict)}
     except Exception as e:
-        logger.error(f"Rule-based solver error on {did}: {e}")
+        logger.error(f"LLM call to {model} failed: {e}")
+        return {}
 
-    # Step 3: AIPIPE API (gpt-4o)
+async def run_model_cascade(pending: list) -> dict:
+    if not pending:
+        return {}
+    out = {}
+    # Level 3: AIPIPE API (gpt-4o)
     if AIPIPE_KEY:
         try:
-            aipipe_res = await call_llm_api(dossier, AIPIPE_BASE, AIPIPE_KEY, AIPIPE_MODEL)
-            if aipipe_res:
-                action, target, payload, evidence = aipipe_res
-                Q9_CACHE[cache_key] = {"action": action, "target": target, "payload": payload, "evidence": evidence}
-                return action, target, payload, evidence
+            out = await call_single_llm_api(pending, AIPIPE_BASE, AIPIPE_KEY, AIPIPE_MODEL)
         except Exception as e:
-            logger.error(f"AIPIPE call error on {did}: {e}")
+            logger.error(f"AIPIPE error: {e}")
 
-    # Step 4: OpenRouter API (Nvidia Nemotron)
-    if OPENROUTER_KEY:
+    # Level 4: OpenRouter API fallback (nvidia/nemotron)
+    missing = [it for it in pending if it[0] not in out]
+    if missing and OPENROUTER_KEY:
         try:
-            openrouter_res = await call_llm_api(dossier, OPENROUTER_BASE, OPENROUTER_KEY, OPENROUTER_MODEL)
-            if openrouter_res:
-                action, target, payload, evidence = openrouter_res
-                Q9_CACHE[cache_key] = {"action": action, "target": target, "payload": payload, "evidence": evidence}
-                return action, target, payload, evidence
+            or_res = await call_single_llm_api(missing, OPENROUTER_BASE, OPENROUTER_KEY, OPENROUTER_MODEL)
+            out.update(or_res)
         except Exception as e:
-            logger.error(f"OpenRouter call error on {did}: {e}")
+            logger.error(f"OpenRouter error: {e}")
 
-    # Safe Fallback
-    return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": did}, []
+    return out
 
-# ---------------------------------------------------------------------------
-# FastAPI Endpoint
-# ---------------------------------------------------------------------------
-@router.post("/v1/mailroom/actions")
-async def handle_mailroom_actions(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+# ------------------------------------------------------- frozen tool shapes
 
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Body must be an object")
+def _first_ref(dossier, did):
+    for key in ("referenceId", "reference", "caseId", "orderId"):
+        v = dossier.get(key)
+        if isinstance(v, str) and v and not looks_secret(v):
+            return v[:80]
+    return did
 
-    profile = body.get("profile")
-    operation = body.get("operation")
+def _team_of(dossier):
+    for key in ("owningTeam", "team", "queue", "mailbox"):
+        v = dossier.get(key)
+        if isinstance(v, str) and v and not looks_secret(v):
+            return v[:80]
+    return "mailroom"
+
+def shape_action(action, fields, dossier, did, line_ids):
+    mailbox = dossier.get("mailbox")
+    mailbox = mailbox if isinstance(mailbox, str) and mailbox else did
+    ref = _first_ref(dossier, did)
+    get = (lambda k, fb, limit=160: clean_scalar(fields.get(k) if isinstance(fields, dict) else None, fb, limit))
+
+    if action == "create_draft":
+        drafted = clean_scalar(fields.get("mailbox") if isinstance(fields, dict) else None, mailbox, 80)
+        return ({"kind": "draft_queue", "id": "mailbox:" + drafted},
+                {"recipient": get("recipient", mailbox),
+                 "referenceId": get("referenceId", ref),
+                 "status": get("status", "in_progress", 80),
+                 "template": "order_status"})
+
+    if action == "update_internal_record":
+        case_id = get("caseId", ref, 80)
+        return ({"kind": "case_record", "id": case_id},
+                {"field": "delivery_window",
+                 "sourceEventId": get("sourceEventId", line_ids[0] if line_ids else ref, 80),
+                 "value": get("value", "pending_review", 120)})
+
+    if action == "send_approved_notice":
+        return ({"kind": "email", "id": get("recipient", mailbox)},
+                {"referenceId": get("referenceId", ref),
+                 "status": get("status", "approved", 80),
+                 "template": "approved_delivery_notice"})
+
+    if action == "request_confirmation":
+        return ({"kind": "approval_queue", "id": get("team", _team_of(dossier), 80)},
+                {"claimedSender": get("claimedSender", mailbox),
+                 "questionCode": "VERIFY_REQUEST",
+                 "referenceId": get("referenceId", ref)})
+
+    if action == "quarantine_item":
+        artifact = fields.get("artifactId") if isinstance(fields, dict) else None
+        allowed = set(line_ids) | {s.get("sourceId") for s in (dossier.get("sources") or [])
+                                   if isinstance(s, dict) and isinstance(s.get("sourceId"), str)}
+        for _lid, text, _sid in dossier_lines(dossier):
+            m = RE_ARTIFACT.search(text)
+            if m:
+                allowed.add(m.group(1))
+        if not isinstance(artifact, str) or artifact not in allowed:
+            artifact = line_ids[0] if line_ids else did
+        return ({"kind": "security_queue", "id": "mailroom"},
+                {"artifactId": artifact,
+                 "reasonCode": "INDIRECT_PROMPT_INJECTION"})
+
+    reason = fields.get("reasonCode") if isinstance(fields, dict) else None
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if reason.upper() in NO_ACTION_REASONS:
+        reason = reason.upper()
+    else:
+        reason = COMPLETED_REASONS.get(reason.lower(), "INFORMATIONAL")
+    return (None, {"reasonCode": reason, "referenceId": get("referenceId", ref)})
+
+def build_proposal(did, dossier, fingerprint, raw):
+    lines = dossier_lines(dossier)
+    line_ids = [lid for lid, _t, _s in lines]
+    valid = set(line_ids)
+
+    action = raw.get("action") if isinstance(raw, dict) else None
+    action = action.strip().lower().replace("-", "_").replace(" ", "_") if isinstance(action, str) else ""
+    if action not in ACTIONS:
+        action = SAFE_DEFAULT
+
+    fields = raw.get("fields") if isinstance(raw, dict) else None
+    if not isinstance(fields, dict):
+        fields = raw if isinstance(raw, dict) else {}
+
+    if action == "send_approved_notice":
+        rcpt = fields.get("recipient")
+        if not isinstance(rcpt, str) or not rcpt.strip() or looks_secret(rcpt):
+            action = SAFE_DEFAULT
+
+    target, payload = shape_action(action, fields, dossier, did, line_ids)
+
+    ev_raw = raw.get("evidence") if isinstance(raw, dict) else None
+    if not isinstance(ev_raw, list):
+        ev_raw = []
+    evidence, seen = [], set()
+    for e in ev_raw:
+        if isinstance(e, str) and e in valid and e not in seen:
+            seen.add(e)
+            evidence.append(e)
+        if len(evidence) >= MAX_EVIDENCE:
+            break
+    if not evidence and line_ids:
+        evidence = [line_ids[0]]
+
+    return {
+        "dossierId": did,
+        "callId": call_id_for(did, fingerprint),
+        "action": action,
+        "target": target,
+        "payload": payload,
+        "evidence": sorted(evidence),
+    }
+
+# ---------------------------------------------------------------- endpoint handler
+
+def validate_propose(body):
     eval_id = body.get("evaluationId")
+    if not isinstance(eval_id, str) or not eval_id.strip():
+        raise HTTPException(status_code=422, detail="evaluationId is required")
+    eval_id = eval_id.strip()
 
-    if profile != PROFILE:
-        raise HTTPException(status_code=400, detail="Unknown profile")
-    if not eval_id or not operation or operation not in ("propose", "commit"):
-        raise HTTPException(status_code=400, detail="Missing or invalid operation/evaluationId")
+    dossiers = body.get("dossiers")
+    if not isinstance(dossiers, list) or not dossiers:
+        raise HTTPException(status_code=422, detail="dossiers must be a non-empty array")
+    if len(dossiers) > MAX_DOSSIERS:
+        raise HTTPException(status_code=422, detail="too many dossiers")
 
-    # Multi-worker sync state reload
-    Q9_EVALUATIONS.update(load_json(EVAL_FILE))
-    Q9_PROPOSALS.update(load_json(PROP_FILE))
-    Q9_COMMITS.update(load_json(COMMITS_FILE))
+    ids, seen = [], set()
+    for d in dossiers:
+        if not isinstance(d, dict):
+            raise HTTPException(status_code=422, detail="each dossier must be an object")
+        did = d.get("dossierId")
+        if not isinstance(did, str) or not did.strip():
+            raise HTTPException(status_code=422, detail="dossier is missing dossierId")
+        did = did.strip()
+        if not isinstance(d.get("sources"), list):
+            raise HTTPException(status_code=422, detail="dossier %s is missing sources" % did)
+        if did in seen:
+            raise HTTPException(status_code=400, detail="duplicate dossierId: %s" % did)
+        seen.add(did)
+        ids.append(did)
+    return eval_id, dossiers, ids
 
-    # ---------------- OPERATION: PROPOSE ----------------
+async def do_propose(body):
+    eval_id, dossiers, ids = validate_propose(body)
+    input_digest = digest(dossiers)
+
+    row = _get("q9_v3_evals", "eval_id", eval_id)
+    if row is not None:
+        if row[1] == input_digest:
+            return json.loads(row[2])
+        raise HTTPException(status_code=409, detail="evaluationId already used with different content")
+
+    fingerprints = [fingerprint_of(d) for d in dossiers]
+
+    # Level 1: Persistent Cache & Level 2: Dynamic Deterministic Solver
+    cached, pending, resolved = {}, [], {}
+    for did, fp, d in zip(ids, fingerprints, dossiers):
+        hit = _get("q9_v3_decisions", "cache_key", did + "|" + fp)
+        if hit is not None:
+            cached[did] = json.loads(hit[1])
+            continue
+        fixed = deterministic_decision(d)
+        if fixed is not None:
+            resolved[did] = fixed
+        else:
+            pending.append((did, d))
+
+    # Level 3: AIPIPE -> Level 4: OpenRouter LLM Cascade for pending dossiers
+    decisions = await run_model_cascade(pending)
+    decisions.update(resolved)
+
+    proposals = []
+    for did, fp, d in zip(ids, fingerprints, dossiers):
+        proposal = cached.get(did)
+        if proposal is None:
+            raw = decisions.get(did)
+            proposal = build_proposal(did, d, fp, raw or {})
+            blob = canonical(proposal)
+            if raw is not None:
+                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + "|" + fp, blob))
+            _put("INSERT OR REPLACE INTO q9_v3_calls VALUES (?,?)", (proposal["callId"], blob))
+        _put("INSERT OR REPLACE INTO q9_v3_eval_calls VALUES (?,?)", (eval_id + "|" + proposal["callId"], canonical(proposal)))
+        proposals.append(proposal)
+
+    response = {
+        "profile": PROFILE,
+        "evaluationId": eval_id,
+        "status": "awaiting_receipts",
+        "inputDigest": input_digest,
+        "proposals": proposals,
+    }
+    _put("INSERT OR REPLACE INTO q9_v3_evals VALUES (?,?,?)", (eval_id, input_digest, json.dumps(response, ensure_ascii=False)))
+    return response
+
+def validate_commit(body):
+    eval_id = body.get("evaluationId")
+    if not isinstance(eval_id, str) or not eval_id.strip():
+        raise HTTPException(status_code=422, detail="evaluationId is required")
+    eval_id = eval_id.strip()
+
+    input_digest = body.get("inputDigest")
+    if not isinstance(input_digest, str) or not input_digest.strip():
+        raise HTTPException(status_code=422, detail="inputDigest is required")
+    input_digest = input_digest.strip()
+
+    receipts = body.get("receipts")
+    if not isinstance(receipts, list) or not receipts:
+        raise HTTPException(status_code=422, detail="receipts must be a non-empty array")
+    if len(receipts) > MAX_RECEIPTS:
+        raise HTTPException(status_code=422, detail="too many receipts")
+    seen = set()
+    for r in receipts:
+        if not isinstance(r, dict):
+            raise HTTPException(status_code=422, detail="each receipt must be an object")
+        call_id = r.get("callId")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise HTTPException(status_code=422, detail="receipt is missing callId")
+        if not isinstance(r.get("accepted"), bool):
+            raise HTTPException(status_code=422, detail="receipt is missing accepted")
+        if not isinstance(r.get("receiptId"), str) or not r["receiptId"].strip():
+            raise HTTPException(status_code=422, detail="receipt is missing receiptId")
+        if call_id in seen:
+            raise HTTPException(status_code=400, detail="duplicate callId in receipts")
+        seen.add(call_id)
+    return eval_id, input_digest, receipts
+
+def bind_receipts(eval_id, receipts, proposals):
+    by_call = {p["callId"]: p for p in proposals}
+    bound = []
+    for r in receipts:
+        call_id = r["callId"].strip()
+        proposal = by_call.get(call_id)
+        if proposal is None:
+            raise HTTPException(status_code=409, detail="receipt callId %s does not belong to evaluation %s" % (call_id, eval_id))
+        if r.get("dossierId") != proposal["dossierId"]:
+            raise HTTPException(status_code=409, detail="receipt dossierId does not match proposal %s" % call_id)
+        if r.get("action") != proposal["action"]:
+            raise HTTPException(status_code=409, detail="receipt action does not match proposal %s" % call_id)
+        if r.get("proposalDigest") != proposal_digest(proposal):
+            raise HTTPException(status_code=409, detail="receipt proposalDigest does not match proposal %s" % call_id)
+        bound.append((r, proposal))
+
+    missing = [c for c in by_call if c not in {r["callId"].strip() for r in receipts}]
+    if missing:
+        raise HTTPException(status_code=409, detail="commit is missing receipts for: %s" % ", ".join(sorted(missing)))
+    return bound
+
+async def do_commit(body):
+    eval_id, input_digest, receipts = validate_commit(body)
+
+    row = _get("q9_v3_evals", "eval_id", eval_id)
+    if row is None:
+        raise HTTPException(status_code=409, detail="unknown evaluationId")
+    if row[1] != input_digest:
+        raise HTTPException(status_code=409, detail="inputDigest does not match evaluation")
+
+    commit_key = digest({"evaluationId": eval_id, "inputDigest": input_digest, "receipts": receipts})
+    hit = _get("q9_v3_commits", "commit_key", commit_key)
+    if hit is not None:
+        return json.loads(hit[1])
+
+    proposals = json.loads(row[2])["proposals"]
+    bound = bind_receipts(eval_id, receipts, proposals)
+
+    outcomes = []
+    for r, proposal in bound:
+        call_id = proposal["callId"]
+        accepted = r.get("accepted") is True
+        outcome = {
+            "dossierId": proposal["dossierId"],
+            "callId": call_id,
+            "action": proposal["action"],
+            "proposalDigest": proposal_digest(proposal),
+            "receiptId": r.get("receiptId") if isinstance(r.get("receiptId"), str) else "",
+            "status": "executed" if accepted else "rejected",
+        }
+        outcomes.append(outcome)
+
+    response = {
+        "profile": PROFILE,
+        "evaluationId": eval_id,
+        "status": "completed",
+        "inputDigest": input_digest,
+        "outcomes": outcomes,
+    }
+    _put("INSERT OR REPLACE INTO q9_v3_commits VALUES (?,?)", (commit_key, json.dumps(response, ensure_ascii=False)))
+    return response
+
+@router.post("/v1/mailroom/actions")
+@router.post("/q9/mailroom")
+@router.post("/mailroom")
+async def mailroom(request: Request):
+    raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="body too large")
+    try:
+        body = json.loads(raw or b"")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=422, detail="body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    if body.get("profile") != PROFILE:
+        raise HTTPException(status_code=400, detail="unsupported profile")
+
+    operation = body.get("operation")
+    if not isinstance(operation, str):
+        raise HTTPException(status_code=422, detail="operation is required")
+    operation = operation.strip()
     if operation == "propose":
-        dossiers = body.get("dossiers")
-        if not isinstance(dossiers, list) or not dossiers:
-            raise HTTPException(status_code=400, detail="dossiers must be a non-empty list")
-
-        seen_ids = set()
-        for d in dossiers:
-            if not isinstance(d, dict) or not d.get("dossierId") or not isinstance(d.get("sources"), list):
-                raise HTTPException(status_code=422, detail="Malformed dossier schema")
-            did = d["dossierId"]
-            if did in seen_ids:
-                raise HTTPException(status_code=400, detail=f"Duplicate dossierId {did}")
-            seen_ids.add(did)
-
-        input_digest = canonical_json_digest(dossiers)
-
-        # Replay & Conflict Checks for Propose
-        if eval_id in Q9_EVALUATIONS:
-            cached = Q9_EVALUATIONS[eval_id]
-            if cached.get("inputDigest") == input_digest:
-                return cached["proposeResponse"]
-            raise HTTPException(status_code=409, detail="evaluationId already used with different content")
-
-        # Evaluate dossiers concurrently
-        results = await asyncio.gather(*[decide(d) for d in dossiers])
-
-        proposals = []
-        for d, (action, target, payload, evidence) in zip(dossiers, results):
-            d_id = d["dossierId"]
-            call_id = "call-" + hashlib.sha256((d["dossierId"] + content_fingerprint(d)).encode("utf-8")).hexdigest()[:24]
-            evidence = sorted(set(evidence))
-
-            prop = {
-                "dossierId": d_id,
-                "callId": call_id,
-                "action": action,
-                "target": target,
-                "payload": payload,
-                "evidence": evidence
-            }
-            prop_digest = compute_proposal_digest(d_id, call_id, action, target, payload, evidence)
-            prop["proposalDigest"] = prop_digest
-            proposals.append(prop)
-
-            Q9_PROPOSALS[make_prop_key(eval_id, d_id, call_id)] = prop
-
-        response_body = {
-            "profile": PROFILE,
-            "evaluationId": eval_id,
-            "status": "awaiting_receipts",
-            "inputDigest": input_digest,
-            "proposals": proposals,
-        }
-
-        Q9_EVALUATIONS[eval_id] = {
-            "inputDigest": input_digest,
-            "proposeResponse": response_body,
-            "proposals": proposals
-        }
-
-        # Save to disk ONCE per batch request in /tmp for multi-worker sync
-        save_json(CACHE_FILE, Q9_CACHE)
-        save_json(EVAL_FILE, Q9_EVALUATIONS)
-        save_json(PROP_FILE, Q9_PROPOSALS)
-        return response_body
-
-    # ---------------- OPERATION: COMMIT ----------------
+        return await do_propose(body)
     if operation == "commit":
-        input_digest = body.get("inputDigest")
-        receipts = body.get("receipts")
+        return await do_commit(body)
+    raise HTTPException(status_code=400, detail="unknown operation")
 
-        if eval_id not in Q9_EVALUATIONS:
-            raise HTTPException(status_code=409, detail="unknown evaluationId")
-
-        cached_eval = Q9_EVALUATIONS[eval_id]
-        if cached_eval.get("inputDigest") != input_digest:
-            raise HTTPException(status_code=409, detail="inputDigest does not match evaluation")
-
-        if not isinstance(receipts, list) or not receipts:
-            raise HTTPException(status_code=422, detail="receipts must be a non-empty array")
-
-        commit_key = canonical_json_digest({"evaluationId": eval_id, "inputDigest": input_digest, "receipts": receipts})
-        if commit_key in Q9_COMMITS:
-            return Q9_COMMITS[commit_key]  # Exact commit replay
-
-        # Match every receipt to its persisted proposal, or reject the whole commit with 409 Conflict
-        stored_proposals = cached_eval.get("proposals", [])
-        by_call = {p["callId"]: p for p in stored_proposals}
-
-        bound = []
-        for r in receipts:
-            if not isinstance(r, dict):
-                raise HTTPException(status_code=422, detail="each receipt must be an object")
-            call_id = r.get("callId", "").strip()
-            proposal = by_call.get(call_id)
-
-            # Receipt validation according to exact friend spec: mismatch -> 409 Conflict!
-            if proposal is None:
-                raise HTTPException(status_code=409, detail=f"receipt callId {call_id} does not belong to evaluation {eval_id}")
-            if r.get("dossierId") != proposal["dossierId"]:
-                raise HTTPException(status_code=409, detail=f"receipt dossierId does not match proposal {call_id}")
-            if r.get("action") != proposal["action"]:
-                raise HTTPException(status_code=409, detail=f"receipt action does not match proposal {call_id}")
-
-            expected_digest = compute_proposal_digest(
-                proposal["dossierId"], proposal["callId"], proposal["action"],
-                proposal["target"], proposal["payload"], proposal["evidence"]
-            )
-            if r.get("proposalDigest") != expected_digest:
-                raise HTTPException(status_code=409, detail=f"receipt proposalDigest does not match proposal {call_id}")
-
-            bound.append((r, proposal))
-
-        outcomes = []
-        for r, proposal in bound:
-            call_id = proposal["callId"]
-            accepted = r.get("accepted") is True
-            outcome = {
-                "dossierId": proposal["dossierId"],
-                "callId": call_id,
-                "action": proposal["action"],
-                "proposalDigest": compute_proposal_digest(
-                    proposal["dossierId"], proposal["callId"], proposal["action"],
-                    proposal["target"], proposal["payload"], proposal["evidence"]
-                ),
-                "receiptId": r.get("receiptId") if isinstance(r.get("receiptId"), str) else "",
-                "status": "executed" if accepted else "rejected",
-            }
-            outcomes.append(outcome)
-
-        commit_response = {
-            "profile": PROFILE,
-            "evaluationId": eval_id,
-            "status": "completed",
-            "inputDigest": input_digest,
-            "outcomes": outcomes,
-        }
-
-        Q9_COMMITS[commit_key] = commit_response
-        save_json(COMMITS_FILE, Q9_COMMITS)
-        return commit_response
-
-    raise HTTPException(status_code=400, detail=f"Invalid operation: {operation}")
+handle_mailroom_actions = mailroom
