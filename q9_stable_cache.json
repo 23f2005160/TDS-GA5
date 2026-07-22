@@ -11,8 +11,7 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_UUNQev4degwA3vw",
-      "ln_wgQiGWhBPbDWzP6"
+      "ln_UUNQev4degwA3vw"
     ]
   },
   "d_SWTHWUtRDmfAyaZM3E:27a43c2a298f58af2ddedf3d4bab747acbb23a77fd9e0d55dbdd21f867c80b64": {
@@ -57,7 +56,6 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_jX54S2BnHyh7BX9",
       "ln_xvSMh6ZaaxRVRJN"
     ]
   },
@@ -70,7 +68,7 @@
     "payload": {
       "claimedSender": "o4r7kyxi@supplier.example",
       "questionCode": "VERIFY_REQUEST",
-      "referenceId": "ORD-KJQKC9BAC9"
+      "referenceId": "ORD-ENCN9HUVQC"
     },
     "evidence": [
       "ln_tj93xTN29V8aTEk"
@@ -110,7 +108,7 @@
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:vendor-assurance"
+      "id": "mailbox:returns"
     },
     "payload": {
       "recipient": "82beh7wy@partner.example",
@@ -135,8 +133,7 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_FrNqkx4Y6ReHtkr",
-      "ln_tTB5qgnMJrF2D7r"
+      "ln_FrNqkx4Y6ReHtkr"
     ]
   },
   "d_LYHmkcaNhQ8tgVG77K:1a0ef5775e992496549f91a0536ae068d2c9240a31526952f2be160e8670f09a": {
@@ -148,7 +145,7 @@
     "payload": {
       "claimedSender": "wwo9gokc@supplier.example",
       "questionCode": "VERIFY_REQUEST",
-      "referenceId": "ORD-YSIQYE44MG"
+      "referenceId": "ORD-U7ABWHJWZA"
     },
     "evidence": [
       "ln_C6bgeec4QFtBZyH"
@@ -210,12 +207,12 @@
     "action": "request_confirmation",
     "target": {
       "kind": "approval_queue",
-      "id": "vendor-assurance"
+      "id": "orders"
     },
     "payload": {
       "claimedSender": "vbetp6xj@partner.example",
       "questionCode": "VERIFY_REQUEST",
-      "referenceId": "ORD-4ZIWVK5QYD"
+      "referenceId": "ORD-LAVRP2R6ME"
     },
     "evidence": [
       "ln_znMcM7djenNnHnS"
@@ -268,7 +265,7 @@
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:fulfilment-leads"
+      "id": "mailbox:returns"
     },
     "payload": {
       "recipient": "o9fucisa@supplier.example",
@@ -308,7 +305,6 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_DRbmGD4kQNLGmb6",
       "ln_rGyReMDrc7yZWc8"
     ]
   },
@@ -369,7 +365,6 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_qm6BtiE6Y4QT4uj",
       "ln_ycEgjsLbxwpEvZk"
     ]
   },
@@ -392,7 +387,7 @@
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:billing-control"
+      "id": "mailbox:returns"
     },
     "payload": {
       "recipient": "8hljeedu@partner.example",
@@ -409,7 +404,7 @@
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:fulfilment-leads"
+      "id": "mailbox:returns"
     },
     "payload": {
       "recipient": "k7vekkta@customer.example",
@@ -441,12 +436,12 @@
     "action": "request_confirmation",
     "target": {
       "kind": "approval_queue",
-      "id": "billing-control"
+      "id": "dispatch"
     },
     "payload": {
       "claimedSender": "93x3zm3z@supplier.example",
       "questionCode": "VERIFY_REQUEST",
-      "referenceId": "ORD-C9ACKVC2XE"
+      "referenceId": "ORD-5UOKRZZHSZ"
     },
     "evidence": [
       "ln_BpfbQgFuKoJF9fT"
@@ -507,8 +502,7 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_dBaJCm2x5JRd93J",
-      "ln_k4TA5C6ecTceiYb"
+      "ln_dBaJCm2x5JRd93J"
     ]
   },
   "d_gJ37HDPdF6hzLo2Qie:91dab9bd625335a41cfe7a9b348ca50712e33c928646240fa620862aef4b5c1d": {
@@ -523,8 +517,7 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_3gBC3bdgujWfHjv",
-      "ln_CzsTsJZMAnQVfhb"
+      "ln_3gBC3bdgujWfHjv"
     ]
   },
   "d_dBaVjhTeKZ6tD6Te8W:522ac7f7941ce48b30ec913f2f56b6d5c10946f15f3b15504602c9d78940023d": {
@@ -546,12 +539,12 @@
     "action": "request_confirmation",
     "target": {
       "kind": "approval_queue",
-      "id": "fulfilment-leads"
+      "id": "vendor-care"
     },
     "payload": {
       "claimedSender": "akklc3an@supplier.example",
       "questionCode": "VERIFY_REQUEST",
-      "referenceId": "ORD-YRJL9RGV2V"
+      "referenceId": "ORD-YVGMCWJRKF"
     },
     "evidence": [
       "ln_34E3rzV3rdZShbb"
@@ -561,7 +554,7 @@
     "action": "request_confirmation",
     "target": {
       "kind": "approval_queue",
-      "id": "fulfilment-leads"
+      "id": "vendor-care"
     },
     "payload": {
       "claimedSender": "rfmjpkyz@customer.example",
@@ -599,7 +592,6 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_Qu9M43vk2D5orP7",
       "ln_ccyZsxSB6Bcvhh7"
     ]
   },
@@ -618,7 +610,7 @@
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:vendor-assurance"
+      "id": "mailbox:vendor-care"
     },
     "payload": {
       "recipient": "ywiz4a2g@supplier.example",
@@ -643,7 +635,6 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_qzJhjMBybUB2rSJ",
       "ln_tXpNmayEaSKDbZF"
     ]
   },
@@ -651,7 +642,7 @@
     "action": "no_action",
     "target": null,
     "payload": {
-      "reasonCode": "DUPLICATE",
+      "reasonCode": "INFORMATIONAL",
       "referenceId": "ORD-FJGXDES6YJ"
     },
     "evidence": [
@@ -670,8 +661,7 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_9H3RAjuWnni8Sxh",
-      "ln_KWuJUZiHJy5LUGA"
+      "ln_9H3RAjuWnni8Sxh"
     ]
   },
   "d_rU2z6BjtNxyxgvtedt:b05c51e4e117149e6ba149fc6a878f9292aa00f690b9ce3653a03f651555853e": {
@@ -693,7 +683,7 @@
     "action": "no_action",
     "target": null,
     "payload": {
-      "reasonCode": "INFORMATIONAL",
+      "reasonCode": "ALREADY_COMPLETED",
       "referenceId": "ORD-IKJOWGDPYT"
     },
     "evidence": [
@@ -709,7 +699,7 @@
     "payload": {
       "claimedSender": "8witvzby@supplier.example",
       "questionCode": "VERIFY_REQUEST",
-      "referenceId": "ORD-OX6EDDERQK"
+      "referenceId": "ORD-XS2RJILV84"
     },
     "evidence": [
       "ln_4DiNe22g2fTmWht"
@@ -779,7 +769,7 @@
     "action": "request_confirmation",
     "target": {
       "kind": "approval_queue",
-      "id": "fulfilment-leads"
+      "id": "returns"
     },
     "payload": {
       "claimedSender": "rqvejsah@customer.example",
@@ -794,7 +784,7 @@
     "action": "no_action",
     "target": null,
     "payload": {
-      "reasonCode": "DUPLICATE",
+      "reasonCode": "ALREADY_COMPLETED",
       "referenceId": "ORD-H7K6NPNC8J"
     },
     "evidence": [
@@ -835,7 +825,7 @@
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:billing-control"
+      "id": "mailbox:customer-care"
     },
     "payload": {
       "recipient": "hgdwu9am@partner.example",
@@ -852,7 +842,7 @@
     "action": "no_action",
     "target": null,
     "payload": {
-      "reasonCode": "INFORMATIONAL",
+      "reasonCode": "ALREADY_COMPLETED",
       "referenceId": "ORD-N5NZXVJ3FA"
     },
     "evidence": [
@@ -880,7 +870,7 @@
     "action": "no_action",
     "target": null,
     "payload": {
-      "reasonCode": "INFORMATIONAL",
+      "reasonCode": "ALREADY_COMPLETED",
       "referenceId": "ORD-IXEFAJAEKM"
     },
     "evidence": [
@@ -891,7 +881,7 @@
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:fulfilment-leads"
+      "id": "mailbox:returns"
     },
     "payload": {
       "recipient": "koka7yy8@customer.example",
@@ -908,7 +898,7 @@
     "action": "request_confirmation",
     "target": {
       "kind": "approval_queue",
-      "id": "billing-control"
+      "id": "vendor-care"
     },
     "payload": {
       "claimedSender": "cvtufmvy@partner.example",
@@ -931,15 +921,14 @@
       "template": "approved_delivery_notice"
     },
     "evidence": [
-      "ln_9ShueQfedsL3sqQ",
-      "ln_LiWx4GvKyrHpbxz"
+      "ln_9ShueQfedsL3sqQ"
     ]
   },
   "d_SxbaJYe2JX3WFEbxJd:cbff1133e40a8893dea4a0a5fd16c59bf0cc8d6ac6b9f717b159b76fcb325bef": {
     "action": "create_draft",
     "target": {
       "kind": "draft_queue",
-      "id": "mailbox:account-security"
+      "id": "mailbox:vendor-care"
     },
     "payload": {
       "recipient": "xfuzpnfg@customer.example",
@@ -961,7 +950,7 @@
     "payload": {
       "claimedSender": "hwgcyjkr@customer.example",
       "questionCode": "VERIFY_REQUEST",
-      "referenceId": "ORD-QSTFDL2NG7"
+      "referenceId": "ORD-QP6USOIQFC"
     },
     "evidence": [
       "ln_wtBrs4mjBKbFted"
