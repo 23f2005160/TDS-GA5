@@ -280,10 +280,16 @@ def build_shapes_for_action(action: str, dossier: dict) -> Tuple[Any, dict, List
                     txt = l.get('text', '')
                     if 'does not match' in txt.lower() or 'identity conflict' in txt.lower():
                         email_m = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', txt)
-                        case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
                         ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                        case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
+                        if not ord_m:
+                            for s2 in sources:
+                                for l2 in s2.get('lines', []):
+                                    om = re.search(r'\b(ORD-[A-Z0-9]+)\b', l2.get('text', ''))
+                                    if om: ord_m = om; break
                         queue_m = re.search(r'requires ([a-zA-Z0-9\-]+) confirmation', txt)
-                        return {'kind': 'approval_queue', 'id': queue_m.group(1) if queue_m else owning_team}, {'claimedSender': email_m.group(1) if email_m else 'unverified@supplier.example', 'questionCode': 'VERIFY_REQUEST', 'referenceId': case_m.group(1) if case_m else (ord_m.group(1) if ord_m else d_id)}, evidence
+                        ref_id = ord_m.group(1) if ord_m else (case_m.group(1) if case_m else d_id)
+                        return {'kind': 'approval_queue', 'id': queue_m.group(1) if queue_m else owning_team}, {'claimedSender': email_m.group(1) if email_m else 'unverified@supplier.example', 'questionCode': 'VERIFY_REQUEST', 'referenceId': ref_id}, evidence
 
     elif action == 'create_draft':
         rcpt, ref, pub_status = None, None, None
@@ -312,30 +318,20 @@ def build_shapes_for_action(action: str, dossier: dict) -> Tuple[Any, dict, List
     elif action == 'no_action':
         ref = d_id
         reason = 'INFORMATIONAL'
-        # First look in authenticated record for reasonCode and reference
+        # Search all sources for ORD- first (public response policy forbids internal CASE- identifiers)
         for s in sources:
-            if s.get('kind') == 'record' and s.get('provenance') == 'authenticated_internal':
-                for l in s.get('lines', []):
-                    txt = l.get('text', '')
-                    lt = txt.lower()
-                    case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', txt)
-                    ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
-                    if 'duplicate' in lt:
-                        reason = 'DUPLICATE'
-                        if case_m and ref == d_id: ref = case_m.group(1)
-                        elif ord_m and ref == d_id: ref = ord_m.group(1)
-                    elif 'informational' in lt or 'terminal event' in lt:
-                        reason = 'INFORMATIONAL'
-                        if case_m and ref == d_id: ref = case_m.group(1)
-                        elif ord_m and ref == d_id: ref = ord_m.group(1)
-        # Fallback: search all sources for a reference
+            for l in s.get('lines', []):
+                txt = l.get('text', '')
+                lt = txt.lower()
+                if 'duplicate' in lt: reason = 'DUPLICATE'
+                elif 'informational' in lt or 'terminal event' in lt: reason = 'INFORMATIONAL'
+                om = re.search(r'\b(ORD-[A-Z0-9]+)\b', txt)
+                if om and ref == d_id: ref = om.group(1)
         if ref == d_id:
             for s in sources:
                 for l in s.get('lines', []):
-                    case_m = re.search(r'\b(CASE-[A-Z0-9]+)\b', l.get('text', ''))
-                    ord_m = re.search(r'\b(ORD-[A-Z0-9]+)\b', l.get('text', ''))
-                    if case_m and ref == d_id: ref = case_m.group(1)
-                    elif ord_m and ref == d_id: ref = ord_m.group(1)
+                    cm = re.search(r'\b(CASE-[A-Z0-9]+)\b', l.get('text', ''))
+                    if cm and ref == d_id: ref = cm.group(1)
         return None, {'reasonCode': reason, 'referenceId': ref}, evidence
 
     return None, {'reasonCode': 'INFORMATIONAL', 'referenceId': d_id}, evidence
