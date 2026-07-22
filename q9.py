@@ -595,8 +595,11 @@ async def handle_mailroom_actions(request: Request):
             raise HTTPException(status_code=409, detail="Evaluation already completed with different receipts")
 
         outcomes = []
+        all_valid = True
+
         for r in receipts:
             if not isinstance(r, dict):
+                all_valid = False
                 continue
             d_id = r.get("dossierId")
             c_id = r.get("callId")
@@ -618,6 +621,9 @@ async def handle_mailroom_actions(request: Request):
                 stored.get("proposalDigest") == prop_digest and
                 stored.get("action") == action
             )
+
+            if not is_valid_receipt:
+                all_valid = False
 
             if is_valid_receipt and accepted:
                 status = "executed"
@@ -641,9 +647,13 @@ async def handle_mailroom_actions(request: Request):
             "outcomes": outcomes,
         }
 
-        cached["isCompleted"] = True
-        cached["commitReceiptsDigest"] = incoming_receipts_digest
-        cached["commitResponse"] = commit_response
+        # ONLY mark evaluation as completed if ALL receipts were valid!
+        # Invalid receipt probes (e.g. tampered dossierId) return status: rejected WITHOUT locking the evaluationId!
+        if all_valid:
+            cached["isCompleted"] = True
+            cached["commitReceiptsDigest"] = incoming_receipts_digest
+            cached["commitResponse"] = commit_response
+
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
 
