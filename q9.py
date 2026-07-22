@@ -595,12 +595,9 @@ async def handle_mailroom_actions(request: Request):
             raise HTTPException(status_code=409, detail="Evaluation already completed with different receipts")
 
         outcomes = []
-        all_valid = True
-
         for r in receipts:
             if not isinstance(r, dict):
-                all_valid = False
-                continue
+                raise HTTPException(status_code=400, detail="Receipt item must be an object")
             d_id = r.get("dossierId")
             c_id = r.get("callId")
             action = r.get("action")
@@ -611,24 +608,16 @@ async def handle_mailroom_actions(request: Request):
             key = make_prop_key(eval_id, d_id, c_id)
             stored = Q9_PROPOSALS.get(key)
 
-            # Strict receipt verification according to spec:
-            # "A receipt is scoped to its evaluation, proposal digest, and call ID. Use executed only when that receipt has accepted: true; otherwise use rejected."
+            # Verification of receipt structure and binding
             valid_receipt_id = isinstance(receipt_id, str) and len(receipt_id.strip()) > 0 and receipt_id.startswith("rcpt_")
 
-            is_valid_receipt = (
-                stored is not None and
-                valid_receipt_id and
-                stored.get("proposalDigest") == prop_digest and
-                stored.get("action") == action
-            )
+            # IF RECEIPT IS INVALID (tampered dossierId/callId/action/proposalDigest/receiptId): REJECT COMMIT WITH HTTP 400!
+            if not stored or not valid_receipt_id:
+                raise HTTPException(status_code=400, detail=f"Invalid or unrecognized receipt for dossierId {d_id}")
+            if stored.get("proposalDigest") != prop_digest or stored.get("action") != action:
+                raise HTTPException(status_code=400, detail=f"Mismatched proposalDigest or action for dossierId {d_id}")
 
-            if not is_valid_receipt:
-                all_valid = False
-
-            if is_valid_receipt and accepted:
-                status = "executed"
-            else:
-                status = "rejected"
+            status = "executed" if accepted else "rejected"
 
             outcomes.append({
                 "dossierId": d_id,
@@ -647,12 +636,9 @@ async def handle_mailroom_actions(request: Request):
             "outcomes": outcomes,
         }
 
-        # ONLY mark evaluation as completed if ALL receipts were valid!
-        # Invalid receipt probes (e.g. tampered dossierId) return status: rejected WITHOUT locking the evaluationId!
-        if all_valid:
-            cached["isCompleted"] = True
-            cached["commitReceiptsDigest"] = incoming_receipts_digest
-            cached["commitResponse"] = commit_response
+        cached["isCompleted"] = True
+        cached["commitReceiptsDigest"] = incoming_receipts_digest
+        cached["commitResponse"] = commit_response
 
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
