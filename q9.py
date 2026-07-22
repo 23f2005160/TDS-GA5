@@ -560,6 +560,16 @@ async def handle_mailroom_actions(request: Request):
         if not isinstance(receipts, list):
             raise HTTPException(status_code=422, detail="receipts must be a list")
 
+        incoming_receipts_digest = canonical_json_digest(receipts)
+
+        # 2. Exact Commit Replay Check
+        if cached.get("isCompleted"):
+            if cached.get("commitReceiptsDigest") == incoming_receipts_digest:
+                return cached["commitResponse"]
+            elif "commitResponse" in cached:
+                # Same evaluationId committed again with different receipts -> HTTP 409 Conflict
+                raise HTTPException(status_code=409, detail="Evaluation already committed with different receipts")
+
         outcomes = []
         for r in receipts:
             if not isinstance(r, dict):
@@ -608,6 +618,7 @@ async def handle_mailroom_actions(request: Request):
         }
 
         cached["isCompleted"] = True
+        cached["commitReceiptsDigest"] = incoming_receipts_digest
         cached["commitResponse"] = commit_response
         save_json(EVAL_FILE, Q9_EVALUATIONS)
         return commit_response
