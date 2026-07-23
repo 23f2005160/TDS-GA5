@@ -100,6 +100,10 @@ def init_db():
                     receipt_id TEXT PRIMARY KEY,
                     eval_id TEXT
                 );
+                CREATE TABLE IF NOT EXISTS q9_v3_callbind (
+                    eval_call TEXT PRIMARY KEY,
+                    receipt_id TEXT
+                );
                 """
             )
     except Exception as e:
@@ -798,9 +802,18 @@ def bind_receipts(eval_id, receipts, proposals):
         # any effect is written; a genuine replay under the same eval still passes.
         receipt_id = r.get("receiptId")
         if isinstance(receipt_id, str) and receipt_id.strip():
-            owner = _get("q9_v3_receipts", "receipt_id", receipt_id.strip())
+            rid = receipt_id.strip()
+            owner = _get("q9_v3_receipts", "receipt_id", rid)
             if owner is not None and owner[1] != eval_id:
-                raise HTTPException(status_code=409, detail="receipt %s was issued for a different evaluation" % receipt_id.strip())
+                raise HTTPException(status_code=409, detail="receipt %s was issued for a different evaluation" % rid)
+            # Per-call binding: a proposal's receipt is immutable. Once a callId in
+            # this evaluation has committed a receiptId, any later commit presenting
+            # a DIFFERENT receiptId for that same callId is a forged/invented receipt
+            # (the grader mints exactly one receipt per proposal). Reject it. A true
+            # replay reuses the identical receiptId and passes.
+            prior = _get("q9_v3_callbind", "eval_call", eval_id + "|" + call_id)
+            if prior is not None and prior[1] != rid:
+                raise HTTPException(status_code=409, detail="receipt for callId %s does not match the receipt bound to this proposal" % call_id)
         bound.append((r, proposal))
 
     missing = [c for c in by_call if c not in {r["callId"].strip() for r in receipts}]
@@ -836,6 +849,13 @@ async def do_commit(body):
             if _get("q9_v3_receipts", "receipt_id", rid.strip()) is None:
                 _put("INSERT OR REPLACE INTO q9_v3_receipts VALUES (?,?)",
                      (rid.strip(), eval_id))
+            # Bind this proposal's callId to its receiptId (first-commit-wins) so a
+            # later commit that invents a different receiptId for the same callId
+            # is rejected as a forged receipt.
+            eval_call = eval_id + "|" + _proposal["callId"]
+            if _get("q9_v3_callbind", "eval_call", eval_call) is None:
+                _put("INSERT OR REPLACE INTO q9_v3_callbind VALUES (?,?)",
+                     (eval_call, rid.strip()))
 
     outcomes = []
     for r, proposal in bound:
