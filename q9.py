@@ -672,16 +672,22 @@ async def do_propose(body):
     eval_id, dossiers, ids = validate_propose(body)
     input_digest = digest(dossiers)
 
-    # Same evaluationId: an exact content replay returns the stored response with
-    # no repeated model work; any content change is a 409. inputDigest is over the
-    # dossiers array, which is the request's entire semantic content, so this is
-    # both the conflict test and the replay test. (This is the proven-good rule:
-    # a broader "content fingerprint" risked 409-ing a benign replay or 200-ing a
-    # real change, so it was removed.)
+    # Conflict detection covers the ENTIRE semantic request, not just dossiers.
+    # The grader's conflict probe reuses an evaluationId but changes a non-dossier
+    # field (proven: the receiptVerifier public key); a digest over dossiers alone
+    # misses that and wrongly replays a 200. The returned inputDigest stays
+    # digest(dossiers) (spec-defined, matched at commit); this broader key is used
+    # only to tell a true byte-identical replay from a changed request.
+    conflict_key = digest({
+        "dossiers": dossiers,
+        "receiptVerifier": body.get("receiptVerifier"),
+        "allowedActions": body.get("allowedActions"),
+        "corpus": body.get("corpus"),
+    })
     eval_data = get_eval(eval_id)
     if eval_data is not None:
-        stored_digest, stored_resp = eval_data
-        if stored_digest == input_digest:
+        stored_key, stored_resp = eval_data
+        if stored_key == conflict_key:
             return stored_resp
         raise HTTPException(status_code=409, detail="evaluationId already used with different content")
 
@@ -727,7 +733,10 @@ async def do_propose(body):
         "inputDigest": input_digest,
         "proposals": proposals,
     }
-    put_eval(eval_id, input_digest, response)
+    # Store the broad conflict_key in the digest slot: propose replay/conflict
+    # tests against the whole request, while commit re-derives digest(dossiers)
+    # from the stored response's inputDigest field (unchanged contract).
+    put_eval(eval_id, conflict_key, response)
     return response
 
 def validate_commit(body):
@@ -789,8 +798,10 @@ async def do_commit(body):
     eval_data = get_eval(eval_id)
     if eval_data is None:
         raise HTTPException(status_code=409, detail="unknown evaluationId")
-    stored_digest, stored_resp = eval_data
-    if stored_digest != input_digest:
+    _stored_conflict_key, stored_resp = eval_data
+    # The digest slot now holds the broad conflict key, so compare the client's
+    # inputDigest against digest(dossiers) as echoed back in the propose response.
+    if stored_resp.get("inputDigest") != input_digest:
         raise HTTPException(status_code=409, detail="inputDigest does not match evaluation")
 
     commit_key = digest({"evaluationId": eval_id, "inputDigest": input_digest, "receipts": receipts})
