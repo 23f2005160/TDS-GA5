@@ -96,6 +96,10 @@ def init_db():
                     effect_key TEXT PRIMARY KEY,
                     outcome TEXT
                 );
+                CREATE TABLE IF NOT EXISTS q9_v3_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    eval_id TEXT
+                );
                 """
             )
     except Exception as e:
@@ -785,6 +789,18 @@ def bind_receipts(eval_id, receipts, proposals):
             raise HTTPException(status_code=409, detail="receipt dossier action does not match proposal %s" % call_id)
         if r.get("proposalDigest") != proposal_digest(proposal):
             raise HTTPException(status_code=409, detail="receipt proposalDigest does not match proposal %s" % call_id)
+        # Eval-scoped receipt binding: a receiptId is minted by the grader for one
+        # (evaluation, callId). Identical stable dossiers make callId/proposalDigest
+        # collide across evaluations, so field-matching alone cannot detect a receipt
+        # transferred from another evaluation. The receiptId, however, is unique per
+        # evaluation. Reject any receiptId already consumed under a DIFFERENT eval
+        # (first-commit-wins) so transferred receipts are rejected atomically before
+        # any effect is written; a genuine replay under the same eval still passes.
+        receipt_id = r.get("receiptId")
+        if isinstance(receipt_id, str) and receipt_id.strip():
+            owner = _get("q9_v3_receipts", "receipt_id", receipt_id.strip())
+            if owner is not None and owner[1] != eval_id:
+                raise HTTPException(status_code=409, detail="receipt %s was issued for a different evaluation" % receipt_id.strip())
         bound.append((r, proposal))
 
     missing = [c for c in by_call if c not in {r["callId"].strip() for r in receipts}]
@@ -811,6 +827,15 @@ async def do_commit(body):
 
     proposals = stored_resp.get("proposals", [])
     bound = bind_receipts(eval_id, receipts, proposals)
+
+    # All receipts verified and bound to THIS evaluation. Record ownership so a
+    # later transfer of any of these receipts into another evaluation is rejected.
+    for r, _proposal in bound:
+        rid = r.get("receiptId")
+        if isinstance(rid, str) and rid.strip():
+            if _get("q9_v3_receipts", "receipt_id", rid.strip()) is None:
+                _put("INSERT OR REPLACE INTO q9_v3_receipts VALUES (?,?)",
+                     (rid.strip(), eval_id))
 
     outcomes = []
     for r, proposal in bound:
