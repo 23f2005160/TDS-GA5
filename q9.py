@@ -672,6 +672,12 @@ async def do_propose(body):
     eval_id, dossiers, ids = validate_propose(body)
     input_digest = digest(dossiers)
 
+    # Same evaluationId: an exact content replay returns the stored response with
+    # no repeated model work; any content change is a 409. inputDigest is over the
+    # dossiers array, which is the request's entire semantic content, so this is
+    # both the conflict test and the replay test. (This is the proven-good rule:
+    # a broader "content fingerprint" risked 409-ing a benign replay or 200-ing a
+    # real change, so it was removed.)
     eval_data = get_eval(eval_id)
     if eval_data is not None:
         stored_digest, stored_resp = eval_data
@@ -807,6 +813,14 @@ async def do_commit(body):
             "receiptId": r.get("receiptId") if isinstance(r.get("receiptId"), str) else "",
             "status": "executed" if accepted else "rejected",
         }
+        # Exactly-once effect: only an accepted receipt executes, and only the
+        # first time for this (evaluation, callId). accepted:false is a valid
+        # receipt the grader declined -> "rejected", never an effect.
+        if accepted:
+            effect_key = eval_id + "|" + call_id
+            if _get("q9_v3_effects", "effect_key", effect_key) is None:
+                _put("INSERT OR REPLACE INTO q9_v3_effects VALUES (?,?)",
+                     (effect_key, canonical(outcome)))
         outcomes.append(outcome)
 
     response = {
