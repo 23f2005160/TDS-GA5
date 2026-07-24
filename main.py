@@ -413,10 +413,10 @@ def check_guardrail(req: GuardrailRequest):
         if posixpath.isabs(raw_path):
             resolved_posix = posixpath.normpath(raw_path)
         else:
-            resolved_posix = posixpath.normpath(posixpath.join(cwd_posix, raw_path))
+            resolved_posix = posixpath.normpath(posixpath.join(write_dir_posix, raw_path))
             
-        # Check 1: Must be inside write_dir directory
-        if resolved_posix != write_dir_posix and not resolved_posix.startswith(write_dir_posix + '/'):
+        # Check 1: Must be strictly inside write_dir directory
+        if not resolved_posix.startswith(write_dir_posix + '/'):
             return {"decision": "block", "reason": f"Write outside allowed directory {write_dir}"}
             
         # Check 2: Must not target secret file
