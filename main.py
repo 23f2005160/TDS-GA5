@@ -138,7 +138,7 @@ def load_student_config():
     global CONFIG
     email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL")
     if not email:
-        print("⚠️ WARNING: STUDENT_EMAIL env var is not set!", flush=True)
+        print("WARNING: STUDENT_EMAIL env var is not set!", flush=True)
         return
         
     for cmd in ["node", "nodejs"]:
@@ -146,12 +146,12 @@ def load_student_config():
             res = subprocess.run([cmd, "generator.js", email], capture_output=True, text=True, check=True)
             CONFIG = json.loads(res.stdout)
             app.state.config = CONFIG
-            print(f"✅ Successfully loaded student configurations using '{cmd}'!", flush=True)
+            print(f"Successfully loaded student configurations using '{cmd}'!", flush=True)
             return
         except Exception as e:
-            print(f"ℹ️ Try with '{cmd}' failed: {e}", flush=True)
+            print(f"Try with '{cmd}' failed: {e}", flush=True)
             
-    print("❌ Failed to generate student configurations.", flush=True)
+    print("Failed to generate student configurations.", flush=True)
 
 def setup_q8_files():
     if not CONFIG or "q8" not in CONFIG:
@@ -174,9 +174,9 @@ def setup_q8_files():
         with open(os.path.join(q8["sandboxRoot"], "encoded", "%2e%2e-literal.txt"), "w") as f:
             f.write(q8["safeEncodedToken"])
             
-        print("✅ Created Q8 Sandbox and Canary files!", flush=True)
+        print("Created Q8 Sandbox and Canary files!", flush=True)
     except Exception as e:
-        print(f"❌ Failed to setup Q8 files: {e}", flush=True)
+        print(f"Failed to setup Q8 files: {e}", flush=True)
 
 @app.on_event("startup")
 def startup_event():
@@ -229,6 +229,10 @@ def check_guardrail(req: GuardrailRequest):
         return {"decision": "block", "reason": "Server not configured with STUDENT_EMAIL"}
         
     q3 = CONFIG["q3"]
+    import posixpath
+    import shlex
+    import fnmatch
+    import urllib.parse
     
     if req.tool == "bash":
         cmd = req.command or ""
@@ -286,22 +290,22 @@ def check_guardrail(req: GuardrailRequest):
             
         # 3. Simulate directory traversal
         sub_commands = re.split(r';|&&|\|\|', decoded_cmd)
-        simulated_cwd = cwd
-        secret_path = os.path.abspath(os.path.join(home_dir, secret_rel))
-        
-        import shlex
-        import fnmatch
+        simulated_cwd = cwd.replace('\\', '/')
+        home_dir_posix = home_dir.replace('\\', '/')
+        secret_rel_posix = secret_rel.replace('\\', '/')
+        secret_path_posix = posixpath.normpath(posixpath.join(home_dir_posix, secret_rel_posix))
+        secret_filename = posixpath.basename(secret_path_posix)
         
         for sub in sub_commands:
             sub = sub.strip()
             cd_match = re.match(r'\bcd\s+([^;\s\&\x7c]+)', sub)
             if cd_match:
                 target_dir = cd_match.group(1).replace("'", "").replace('"', "")
-                target_dir = target_dir.replace("$HOME", home_dir).replace("~", home_dir)
-                if target_dir.startswith('/'):
-                    simulated_cwd = os.path.abspath(target_dir)
+                target_dir = target_dir.replace("$HOME", home_dir_posix).replace("~", home_dir_posix).replace('\\', '/')
+                if posixpath.isabs(target_dir):
+                    simulated_cwd = posixpath.normpath(target_dir)
                 else:
-                    simulated_cwd = os.path.abspath(os.path.join(simulated_cwd, target_dir))
+                    simulated_cwd = posixpath.normpath(posixpath.join(simulated_cwd, target_dir))
                     
             try:
                 tokens = shlex.split(sub)
@@ -312,27 +316,67 @@ def check_guardrail(req: GuardrailRequest):
                 if not token:
                     continue
                 token_clean = token.replace("'", "").replace('"', "")
-                token_clean = token_clean.replace("$HOME", home_dir).replace("~", home_dir)
+                token_clean = token_clean.replace("$HOME", home_dir_posix).replace("~", home_dir_posix).replace('\\', '/')
                 
-                if os.path.isabs(token_clean):
-                    resolved = os.path.abspath(token_clean)
-                else:
-                    resolved = os.path.abspath(os.path.join(simulated_cwd, token_clean))
+                if secret_filename and secret_filename in token_clean:
+                    return {"decision": "block", "reason": f"Access to secret file {secret_rel} is blocked."}
                     
-                if (fnmatch.fnmatch(secret_path, resolved) or 
-                    fnmatch.fnmatch(secret_path, resolved + "/*") or 
-                    fnmatch.fnmatch(secret_path, resolved + "/*.*")):
+                if posixpath.isabs(token_clean):
+                    resolved_posix = posixpath.normpath(token_clean)
+                else:
+                    resolved_posix = posixpath.normpath(posixpath.join(simulated_cwd, token_clean))
+                    
+                if (resolved_posix == secret_path_posix or 
+                    resolved_posix.startswith(secret_path_posix + '/') or
+                    fnmatch.fnmatch(secret_path_posix, resolved_posix) or 
+                    fnmatch.fnmatch(secret_path_posix, resolved_posix + "/*")):
                     return {"decision": "block", "reason": f"Access to secret file {secret_rel} is blocked."}
                     
         return {"decision": "allow", "reason": "Command looks safe"}
         
     elif req.tool == "write_file":
         path = req.path or ""
-        full_path = path if os.path.isabs(path) else os.path.join(q3["cwd"], path)
-        resolved = os.path.abspath(full_path)
+        if not path or not path.strip():
+            return {"decision": "block", "reason": "Empty write path"}
+            
+        home_dir = q3["homeDir"]
+        cwd = q3["cwd"]
+        write_dir = q3["writeDir"]
+        secret_rel = q3["secretRel"]
         
-        if not resolved.startswith(q3["writeDir"]):
-            return {"decision": "block", "reason": f"Write outside allowed directory {q3['writeDir']}"}
+        home_dir_posix = home_dir.replace('\\', '/')
+        cwd_posix = cwd.replace('\\', '/')
+        write_dir_posix = write_dir.replace('\\', '/').rstrip('/')
+        secret_rel_posix = secret_rel.replace('\\', '/')
+        secret_path_posix = posixpath.normpath(posixpath.join(home_dir_posix, secret_rel_posix))
+        
+        # 1. Unquote URL encoding recursively
+        raw_path = path
+        for _ in range(5):
+            unquoted = urllib.parse.unquote(raw_path)
+            if unquoted == raw_path:
+                break
+            raw_path = unquoted
+            
+        # 2. Handle null bytes
+        if '\x00' in raw_path:
+            return {"decision": "block", "reason": "Null byte in write path"}
+            
+        # 3. Expand variables and tilde
+        raw_path = raw_path.replace("$HOME", home_dir_posix).replace("~", home_dir_posix).replace('\\', '/')
+        
+        if posixpath.isabs(raw_path):
+            resolved_posix = posixpath.normpath(raw_path)
+        else:
+            resolved_posix = posixpath.normpath(posixpath.join(cwd_posix, raw_path))
+            
+        # Check 1: Must be inside write_dir directory
+        if resolved_posix != write_dir_posix and not resolved_posix.startswith(write_dir_posix + '/'):
+            return {"decision": "block", "reason": f"Write outside allowed directory {write_dir}"}
+            
+        # Check 2: Must not target secret file
+        if resolved_posix == secret_path_posix or resolved_posix.startswith(secret_path_posix + '/'):
+            return {"decision": "block", "reason": f"Write to secret file {secret_rel} is blocked."}
             
         return {"decision": "allow", "reason": "Write path is safe"}
         
