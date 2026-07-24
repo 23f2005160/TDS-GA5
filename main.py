@@ -224,6 +224,8 @@ def startup_event():
     setup_q8_files()
 
 @app.get("/")
+@app.head("/")
+@app.options("/")
 def read_root():
     email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL") or "Not configured"
     return {"status": "ok", "message": "GA-5 Universal Monolith is running!", "email": email}
@@ -262,6 +264,12 @@ class GuardrailRequest(BaseModel):
     content: Optional[str] = None
     method: Optional[str] = None
     url: Optional[str] = None
+
+@app.get("/q3/check")
+@app.head("/q3/check")
+@app.options("/q3/check")
+def check_guardrail_get():
+    return {"status": "ok", "message": "Q3 Guardrail endpoint is ready"}
 
 @app.post("/q3/check")
 def check_guardrail(req: GuardrailRequest):
