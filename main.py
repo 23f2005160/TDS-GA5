@@ -318,9 +318,6 @@ def check_guardrail(req: GuardrailRequest):
                 token_clean = token.replace("'", "").replace('"', "")
                 token_clean = token_clean.replace("$HOME", home_dir_posix).replace("~", home_dir_posix).replace('\\', '/')
                 
-                if secret_filename and secret_filename in token_clean:
-                    return {"decision": "block", "reason": f"Access to secret file {secret_rel} is blocked."}
-                    
                 if posixpath.isabs(token_clean):
                     resolved_posix = posixpath.normpath(token_clean)
                 else:
