@@ -34,6 +34,7 @@ CONFIG = {}
 
 # Debug log containers per question
 LOGS_MAIN = deque(maxlen=200)
+LOGS_Q3 = deque(maxlen=200)
 LOGS_Q8 = deque(maxlen=200)
 LOGS_Q9 = deque(maxlen=200)
 LOGS_Q10 = deque(maxlen=200)
@@ -62,25 +63,46 @@ async def log_requests(request: Request, call_next):
         response = await call_next(request)
     except Exception as e:
         error_message = str(e)
-        response = Response(status_code=500, content=f"Internal Server Error: {e}")
-        
-    duration = time.time() - start_time
-    path = request.url.path.lower()
-    
-    body_limit = 500000 if any(k in path for k in ["q9", "mailroom", "q10", "q11", "incidents", "agent-card"]) else 2000
+        log_entry = {
+            "timestamp": time.time(),
+            "method": request.method,
+            "url": str(request.url),
+            "headers": dict(request.headers),
+            "body": body_str[:1000],
+            "status_code": 500,
+            "duration_ms": round((time.time() - start_time) * 1000, 2),
+            "error": str(e)
+        }
+        if "/q3" in request.url.path:
+            LOGS_Q3.append(log_entry)
+        elif "/q8" in request.url.path:
+            LOGS_Q8.append(log_entry)
+        elif "/q9" in request.url.path or "mailroom" in request.url.path:
+            LOGS_Q9.append(log_entry)
+        elif "/q10" in request.url.path or "agent-card" in request.url.path:
+            LOGS_Q10.append(log_entry)
+        elif "/q11" in request.url.path:
+            LOGS_Q11.append(log_entry)
+        else:
+            LOGS_MAIN.append(log_entry)
+        raise e
+
+    duration = round((time.time() - start_time) * 1000, 2)
     log_entry = {
         "timestamp": time.time(),
         "method": request.method,
         "url": str(request.url),
         "headers": dict(request.headers),
-        "body": body_bytes.decode('utf-8', errors='ignore')[:body_limit],
-        "status_code": response.status_code if response else 500,
-        "duration_ms": int(duration * 1000),
-        "error": error_message
+        "body": body_str[:1000],
+        "status_code": response.status_code,
+        "duration_ms": duration,
+        "error": None
     }
     
-    # Categorize logs into question-specific queues
-    if "/q8" in path:
+    path = request.url.path
+    if "/q3" in path:
+        LOGS_Q3.append(log_entry)
+    elif "/q8" in path:
         LOGS_Q8.append(log_entry)
     elif "/q9" in path or "mailroom" in path:
         LOGS_Q9.append(log_entry)
@@ -89,14 +111,13 @@ async def log_requests(request: Request, call_next):
     elif "/q11" in path or "/v2/incidents" in path:
         LOGS_Q11.append(log_entry)
     elif path == "/check":
-        # Dynamic router path: inspect body to route log entry
         body_text = log_entry["body"]
         if "arguments" in body_text:
             LOGS_Q8.append(log_entry)
         elif "budget_tokens" in body_text or "steps" in body_text:
-            LOGS_MAIN.append(log_entry) # Q5
+            LOGS_MAIN.append(log_entry)
         else:
-            LOGS_MAIN.append(log_entry) # Q3
+            LOGS_Q3.append(log_entry)
     else:
         LOGS_MAIN.append(log_entry)
         
@@ -106,13 +127,17 @@ async def log_requests(request: Request, call_next):
 # Log inspection endpoints
 @app.get("/debug/logs")
 def get_all_debug_logs():
-    all_logs = list(LOGS_MAIN) + list(LOGS_Q8) + list(LOGS_Q9) + list(LOGS_Q10) + list(LOGS_Q11)
+    all_logs = list(LOGS_MAIN) + list(LOGS_Q3) + list(LOGS_Q8) + list(LOGS_Q9) + list(LOGS_Q10) + list(LOGS_Q11)
     all_logs.sort(key=lambda x: x["timestamp"])
     return all_logs
 
 @app.get("/debug/logs/main")
 def get_main_debug_logs():
     return list(LOGS_MAIN)
+
+@app.get("/debug/logs/q3")
+def get_q3_debug_logs():
+    return list(LOGS_Q3)
 
 @app.get("/debug/logs/q8")
 def get_q8_debug_logs():
