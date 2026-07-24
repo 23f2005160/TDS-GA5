@@ -57,6 +57,7 @@ async def log_requests(request: Request, call_next):
             pass
 
     start_time = time.time()
+    body_str = body_bytes.decode('utf-8', errors='ignore')
     response = None
     error_message = None
     try:
