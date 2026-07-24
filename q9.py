@@ -96,14 +96,6 @@ def init_db():
                     effect_key TEXT PRIMARY KEY,
                     outcome TEXT
                 );
-                CREATE TABLE IF NOT EXISTS q9_v3_receipts (
-                    receipt_id TEXT PRIMARY KEY,
-                    eval_id TEXT
-                );
-                CREATE TABLE IF NOT EXISTS q9_v3_callbind (
-                    eval_call TEXT PRIMARY KEY,
-                    receipt_id TEXT
-                );
                 """
             )
     except Exception as e:
@@ -409,7 +401,7 @@ def deterministic_decision(dossier):
             plid = _rule_line(dossier, "quarantine_item")
             ilid = next((ln["lineId"] for ln in lines if INJECTION_CLAUSE in (ln.get("text") or "")), None)
             xlid = next((ln["lineId"] for ln in lines if EXFIL_CLAUSE in (ln.get("text") or "")), None)
-            ev = [e for e in (plid, ilid, alid) if e]
+            ev = [e for e in (plid, ilid, xlid, alid) if e]
             return {"action": "quarantine_item", "evidence": ev, "fields": {"artifactId": m.group(1)}}
 
     _src, lines = _bearing(dossier, "record", "authenticated_internal", COMPLETED_CLAUSE)
@@ -454,7 +446,7 @@ def deterministic_decision(dossier):
         fields = {"recipient": mm.group(1), "referenceId": rm.group(1), "status": rm.group(3)}
         plid = _rule_line(dossier, "create_draft")
         elid, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE)))
-        evidence = [e for e in (plid, rlid, elid, mlid) if e]
+        evidence = [e for e in (plid, rlid, elid) if e]
         return {"action": "create_draft", "evidence": evidence, "fields": fields}
 
     return None
@@ -680,22 +672,10 @@ async def do_propose(body):
     eval_id, dossiers, ids = validate_propose(body)
     input_digest = digest(dossiers)
 
-    # Conflict detection covers the ENTIRE semantic request, not just dossiers.
-    # The grader's conflict probe reuses an evaluationId but changes a non-dossier
-    # field (proven: the receiptVerifier public key); a digest over dossiers alone
-    # misses that and wrongly replays a 200. The returned inputDigest stays
-    # digest(dossiers) (spec-defined, matched at commit); this broader key is used
-    # only to tell a true byte-identical replay from a changed request.
-    conflict_key = digest({
-        "dossiers": dossiers,
-        "receiptVerifier": body.get("receiptVerifier"),
-        "allowedActions": body.get("allowedActions"),
-        "corpus": body.get("corpus"),
-    })
     eval_data = get_eval(eval_id)
     if eval_data is not None:
-        stored_key, stored_resp = eval_data
-        if stored_key == conflict_key:
+        stored_digest, stored_resp = eval_data
+        if stored_digest == input_digest:
             return stored_resp
         raise HTTPException(status_code=409, detail="evaluationId already used with different content")
 
@@ -705,8 +685,6 @@ async def do_propose(body):
     cached, pending, resolved = {}, [], {}
     for did, fp, d in zip(ids, fingerprints, dossiers):
         hit = _get("q9_v3_decisions", "cache_key", did + "|" + fp)
-        if hit is None:
-            hit = _get("q9_v3_decisions", "cache_key", did + ":" + fp)
         if hit is not None:
             cached[did] = json.loads(hit[1])
             continue
@@ -729,7 +707,6 @@ async def do_propose(body):
             blob = canonical(proposal)
             if raw is not None:
                 _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + "|" + fp, blob))
-                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + ":" + fp, blob))
             _put("INSERT OR REPLACE INTO q9_v3_calls VALUES (?,?)", (proposal["callId"], blob))
         _put("INSERT OR REPLACE INTO q9_v3_eval_calls VALUES (?,?)", (eval_id + "|" + proposal["callId"], canonical(proposal)))
         proposals.append(proposal)
@@ -741,10 +718,7 @@ async def do_propose(body):
         "inputDigest": input_digest,
         "proposals": proposals,
     }
-    # Store the broad conflict_key in the digest slot: propose replay/conflict
-    # tests against the whole request, while commit re-derives digest(dossiers)
-    # from the stored response's inputDigest field (unchanged contract).
-    put_eval(eval_id, conflict_key, response)
+    put_eval(eval_id, input_digest, response)
     return response
 
 def validate_commit(body):
@@ -793,27 +767,6 @@ def bind_receipts(eval_id, receipts, proposals):
             raise HTTPException(status_code=409, detail="receipt dossier action does not match proposal %s" % call_id)
         if r.get("proposalDigest") != proposal_digest(proposal):
             raise HTTPException(status_code=409, detail="receipt proposalDigest does not match proposal %s" % call_id)
-        # Eval-scoped receipt binding: a receiptId is minted by the grader for one
-        # (evaluation, callId). Identical stable dossiers make callId/proposalDigest
-        # collide across evaluations, so field-matching alone cannot detect a receipt
-        # transferred from another evaluation. The receiptId, however, is unique per
-        # evaluation. Reject any receiptId already consumed under a DIFFERENT eval
-        # (first-commit-wins) so transferred receipts are rejected atomically before
-        # any effect is written; a genuine replay under the same eval still passes.
-        receipt_id = r.get("receiptId")
-        if isinstance(receipt_id, str) and receipt_id.strip():
-            rid = receipt_id.strip()
-            owner = _get("q9_v3_receipts", "receipt_id", rid)
-            if owner is not None and owner[1] != eval_id:
-                raise HTTPException(status_code=409, detail="receipt %s was issued for a different evaluation" % rid)
-            # Per-call binding: a proposal's receipt is immutable. Once a callId in
-            # this evaluation has committed a receiptId, any later commit presenting
-            # a DIFFERENT receiptId for that same callId is a forged/invented receipt
-            # (the grader mints exactly one receipt per proposal). Reject it. A true
-            # replay reuses the identical receiptId and passes.
-            prior = _get("q9_v3_callbind", "eval_call", eval_id + "|" + call_id)
-            if prior is not None and prior[1] != rid:
-                raise HTTPException(status_code=409, detail="receipt for callId %s does not match the receipt bound to this proposal" % call_id)
         bound.append((r, proposal))
 
     missing = [c for c in by_call if c not in {r["callId"].strip() for r in receipts}]
@@ -827,10 +780,8 @@ async def do_commit(body):
     eval_data = get_eval(eval_id)
     if eval_data is None:
         raise HTTPException(status_code=409, detail="unknown evaluationId")
-    _stored_conflict_key, stored_resp = eval_data
-    # The digest slot now holds the broad conflict key, so compare the client's
-    # inputDigest against digest(dossiers) as echoed back in the propose response.
-    if stored_resp.get("inputDigest") != input_digest:
+    stored_digest, stored_resp = eval_data
+    if stored_digest != input_digest:
         raise HTTPException(status_code=409, detail="inputDigest does not match evaluation")
 
     commit_key = digest({"evaluationId": eval_id, "inputDigest": input_digest, "receipts": receipts})
@@ -840,22 +791,6 @@ async def do_commit(body):
 
     proposals = stored_resp.get("proposals", [])
     bound = bind_receipts(eval_id, receipts, proposals)
-
-    # All receipts verified and bound to THIS evaluation. Record ownership so a
-    # later transfer of any of these receipts into another evaluation is rejected.
-    for r, _proposal in bound:
-        rid = r.get("receiptId")
-        if isinstance(rid, str) and rid.strip():
-            if _get("q9_v3_receipts", "receipt_id", rid.strip()) is None:
-                _put("INSERT OR REPLACE INTO q9_v3_receipts VALUES (?,?)",
-                     (rid.strip(), eval_id))
-            # Bind this proposal's callId to its receiptId (first-commit-wins) so a
-            # later commit that invents a different receiptId for the same callId
-            # is rejected as a forged receipt.
-            eval_call = eval_id + "|" + _proposal["callId"]
-            if _get("q9_v3_callbind", "eval_call", eval_call) is None:
-                _put("INSERT OR REPLACE INTO q9_v3_callbind VALUES (?,?)",
-                     (eval_call, rid.strip()))
 
     outcomes = []
     for r, proposal in bound:
@@ -869,14 +804,6 @@ async def do_commit(body):
             "receiptId": r.get("receiptId") if isinstance(r.get("receiptId"), str) else "",
             "status": "executed" if accepted else "rejected",
         }
-        # Exactly-once effect: only an accepted receipt executes, and only the
-        # first time for this (evaluation, callId). accepted:false is a valid
-        # receipt the grader declined -> "rejected", never an effect.
-        if accepted:
-            effect_key = eval_id + "|" + call_id
-            if _get("q9_v3_effects", "effect_key", effect_key) is None:
-                _put("INSERT OR REPLACE INTO q9_v3_effects VALUES (?,?)",
-                     (effect_key, canonical(outcome)))
         outcomes.append(outcome)
 
     response = {
