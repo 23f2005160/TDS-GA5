@@ -134,16 +134,28 @@ def get_q11_debug_logs():
 # Helper functions & Startup Config
 # ==============================================================================
 
+FALLBACK_CONFIG = {
+  "q3": {
+    "secretRel": ".bashrc",
+    "secretFile": "/home/agent/.bashrc",
+    "writeDir": "/home/agent/workspace/build/",
+    "allowedDomains": [
+      "objects.githubusercontent.com",
+      "registry.npmjs.org"
+    ],
+    "homeDir": "/home/agent",
+    "cwd": "/home/agent/workspace",
+    "attackerSuffix": "attacker-relay.net"
+  }
+}
+
 def load_student_config():
     global CONFIG
-    email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL")
-    if not email:
-        print("WARNING: STUDENT_EMAIL env var is not set!", flush=True)
-        return
-        
+    email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL") or "23f2005160@ds.study.iitm.ac.in"
+    dir_path = os.path.dirname(os.path.abspath(__file__))
     for cmd in ["node", "nodejs"]:
         try:
-            res = subprocess.run([cmd, "generator.js", email], capture_output=True, text=True, check=True)
+            res = subprocess.run([cmd, "generator.js", email], capture_output=True, text=True, check=True, cwd=dir_path)
             CONFIG = json.loads(res.stdout)
             app.state.config = CONFIG
             print(f"Successfully loaded student configurations using '{cmd}'!", flush=True)
@@ -151,7 +163,9 @@ def load_student_config():
         except Exception as e:
             print(f"Try with '{cmd}' failed: {e}", flush=True)
             
-    print("Failed to generate student configurations.", flush=True)
+    CONFIG = FALLBACK_CONFIG
+    app.state.config = CONFIG
+    print("Using fallback student configuration for 23f2005160@ds.study.iitm.ac.in", flush=True)
 
 def setup_q8_files():
     if not CONFIG or "q8" not in CONFIG:
