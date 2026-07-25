@@ -735,15 +735,6 @@ async def do_propose(body):
     eval_id, dossiers, ids = validate_propose(body)
     input_digest = digest(dossiers)
 
-    # Persist the receipt-verifier public key up front so it is available at
-    # commit even when this propose is served from cache (replay) or a later
-    # worker/restart reloads the evaluation. Commit needs it to verify sigs.
-    verifier = body.get("receiptVerifier")
-    if isinstance(verifier, dict):
-        jwk = verifier.get("publicKeyJwk")
-        if isinstance(jwk, dict):
-            put_verifier(eval_id, jwk)
-
     # Conflict detection covers the ENTIRE semantic request, not just dossiers.
     # The grader's conflict probe reuses an evaluationId but changes a non-dossier
     # field (proven: the receiptVerifier public key); a digest over dossiers alone
