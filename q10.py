@@ -236,16 +236,53 @@ def _build_proposals(packages: List[dict]) -> List[dict]:
     return proposals
 
 
+def _mk_artifact(prefix, batch_id, mt, payload, name):
+    # Canonical A2A: payload lives inside parts[].data. Keep mediaType at the
+    # top level too for lenient readers (belt-and-suspenders).
+    return {
+        "artifactId": prefix + hashlib.sha256(batch_id.encode()).hexdigest()[:12],
+        "name": name,
+        "mediaType": mt,
+        "parts": [{"kind": "data", "mediaType": mt, "data": payload}],
+        "data": payload,
+    }
+
+
 def _proposals_artifact(batch_id, proposals):
-    return {"artifactId": "art_prop_" + hashlib.sha256(batch_id.encode()).hexdigest()[:12],
-            "mediaType": PROP_MT,
-            "data": {"batchId": batch_id, "proposals": proposals}}
+    return _mk_artifact("art_prop_", batch_id, PROP_MT,
+                        {"batchId": batch_id, "proposals": proposals},
+                        "invoice-action-proposals")
 
 
 def _receipts_artifact(batch_id, receipts):
-    return {"artifactId": "art_rcpt_" + hashlib.sha256(batch_id.encode()).hexdigest()[:12],
-            "mediaType": RCPT_MT,
-            "data": {"batchId": batch_id, "receipts": receipts}}
+    return _mk_artifact("art_rcpt_", batch_id, RCPT_MT,
+                        {"batchId": batch_id, "receipts": receipts},
+                        "invoice-action-receipts")
+
+
+def _artifact_mt(a: dict) -> Optional[str]:
+    if a.get("mediaType"):
+        return a["mediaType"]
+    for p in a.get("parts", []):
+        if p.get("mediaType"):
+            return p["mediaType"]
+    return None
+
+
+def _artifact_data(a: dict) -> dict:
+    if isinstance(a.get("data"), dict):
+        return a["data"]
+    for p in a.get("parts", []):
+        if isinstance(p.get("data"), dict):
+            return p["data"]
+    return {}
+
+
+def _find_artifact(task: dict, mt: str) -> Optional[dict]:
+    for a in task.get("artifacts", []):
+        if _artifact_mt(a) == mt:
+            return a
+    return None
 
 
 def _new_task(task_id, principal, msg_id, batch_id, proposals):
@@ -327,7 +364,7 @@ def _execute(task: dict, accepted) -> dict:
     task = dict(task)
     task["status"] = {"state": STATE_COMPLETED}
     task["state"] = STATE_COMPLETED
-    arts = [a for a in task.get("artifacts", []) if a.get("mediaType") == PROP_MT]
+    arts = [a for a in task.get("artifacts", []) if _artifact_mt(a) == PROP_MT]
     arts.append(_receipts_artifact(batch_id, receipts))
     task["artifacts"] = arts
     return task
@@ -401,9 +438,8 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
         if task.get("state") in (STATE_COMPLETED, STATE_CANCELED):
             return A2AResponse(content={"task": task})
         # Extract and strictly validate the results payload.
-        prop_art = next((a for a in task.get("artifacts", [])
-                         if a.get("mediaType") == PROP_MT), None)
-        proposals = (prop_art or {}).get("data", {}).get("proposals", [])
+        prop_art = _find_artifact(task, PROP_MT)
+        proposals = _artifact_data(prop_art or {}).get("proposals", [])
         results = _extract_results(msg)
         if results is None:
             raise HTTPException(status_code=409, detail="Continuation missing results payload")
