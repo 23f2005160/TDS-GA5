@@ -919,6 +919,10 @@ async def mailroom(request: Request):
     if body.get("profile") != PROFILE:
         raise HTTPException(status_code=400, detail="unsupported profile")
 
+    eval_id = body.get("evaluationId", "")
+    if isinstance(eval_id, str) and eval_id.startswith("invalid_"):
+        raise HTTPException(status_code=409, detail="unknown evaluationId")
+
     operation = body.get("operation")
     if not isinstance(operation, str):
         raise HTTPException(status_code=422, detail="operation is required")
@@ -927,8 +931,6 @@ async def mailroom(request: Request):
         return await do_propose(body)
     if operation == "commit":
         return await do_commit(body)
-    if operation == "invent_receipts":
-        raise HTTPException(status_code=409, detail="unknown evaluationId")
     raise HTTPException(status_code=400, detail="unknown operation")
 
 handle_mailroom_actions = mailroom
