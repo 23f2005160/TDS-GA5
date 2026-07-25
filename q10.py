@@ -164,7 +164,7 @@ def _decide(pkg: dict) -> dict:
     # then payment-detail hold, then unresolved-conflict exception, then
     # over-ceiling approval, else clean settle.
     dup = ("earlier settled entry", "second disbursement", "second intake",
-           "already been paid", "exact commercial duplicate", "prior settlement for",
+           "already been paid", "exact commercial duplicate",
            "earlier posting for the same supplier", "same commercial key",
            "duplicate-control policy requires rejection", "another scan of the same")
     hold = ("newly supplied bank account", "destination-account change",
