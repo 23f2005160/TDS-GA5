@@ -7,6 +7,8 @@ import sqlite3
 import tempfile
 from fastapi import APIRouter, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing import Dict, Any, Optional, List
 
 router = APIRouter()
@@ -26,6 +28,26 @@ VALID_ACTIONS = ("settle_invoice", "request_approval", "hold_invoice",
 
 class A2AResponse(JSONResponse):
     media_type = A2A_CT
+
+
+def _a2a_error(status_code: int, detail: str) -> A2AResponse:
+    return A2AResponse(status_code=status_code,
+                       content={"error": {"code": status_code, "message": detail}})
+
+
+import functools
+
+
+def a2a_endpoint(fn):
+    """Ensure every response — including error paths — is application/a2a+json.
+    The A2A guide treats a plain application/json error as a protocol failure."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except StarletteHTTPException as e:
+            return _a2a_error(e.status_code, str(e.detail))
+    return wrapper
 
 
 # ------------------------------------------------------------------ storage
@@ -290,7 +312,6 @@ def _new_task(task_id, principal, msg_id, batch_id, proposals):
         "id": task_id, "contextId": batch_id, "kind": "task",
         "status": {"state": STATE_INPUT},
         "state": STATE_INPUT,                       # convenience mirror
-        "principal": principal, "messageId": msg_id,
         "artifacts": [_proposals_artifact(batch_id, proposals)],
     }
 
@@ -381,6 +402,7 @@ def _base_url(request: Request) -> str:
 
 
 @router.get("/.well-known/agent-card.json")
+@a2a_endpoint
 async def agent_card(request: Request):
     base = _base_url(request)
     return A2AResponse(content={
@@ -410,6 +432,7 @@ async def agent_card(request: Request):
 
 @router.post("/a2a/message:send")
 @router.post("/message:send")
+@a2a_endpoint
 async def send_message(request: Request, authorization: Optional[str] = Header(None)):
     principal = _require_auth(authorization)
     ct = request.headers.get("content-type", "")
@@ -475,6 +498,7 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
 
 @router.get("/a2a/tasks")
 @router.get("/tasks")
+@a2a_endpoint
 async def list_tasks(request: Request, authorization: Optional[str] = Header(None)):
     principal = _require_auth(authorization)
     _require_version(request)
@@ -483,9 +507,11 @@ async def list_tasks(request: Request, authorization: Optional[str] = Header(Non
 
 @router.get("/a2a/tasks/{task_id}")
 @router.get("/tasks/{task_id}")
+@a2a_endpoint
 async def get_task(task_id: str, request: Request,
                    authorization: Optional[str] = Header(None)):
     principal = _require_auth(authorization)
+    _require_version(request)
     rec = _load_task(task_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -498,9 +524,11 @@ async def get_task(task_id: str, request: Request,
 
 @router.post("/a2a/tasks/{task_id}:cancel")
 @router.post("/tasks/{task_id}:cancel")
+@a2a_endpoint
 async def cancel_task(task_id: str, request: Request,
                       authorization: Optional[str] = Header(None)):
     principal = _require_auth(authorization)
+    _require_version(request)
     rec = _load_task(task_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="Task not found")
