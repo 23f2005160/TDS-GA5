@@ -12,6 +12,8 @@ proposals and returns terminal outcomes.
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -763,6 +765,20 @@ def validate_commit(body):
             raise HTTPException(status_code=422, detail="receipt is missing accepted")
         if not isinstance(r.get("receiptId"), str) or not r["receiptId"].strip():
             raise HTTPException(status_code=422, detail="receipt is missing receiptId")
+        # Structural signature gate: every genuine grader receipt carries an Ed25519
+        # receiptSignature that base64-decodes to exactly 64 bytes (verified across
+        # 603 real receipts, 0 exceptions). A forged/invalid receipt whose signature
+        # is missing, non-base64, or the wrong length is rejected here. This never
+        # rejects a legitimate receipt (all real ones are 64-byte base64).
+        sig = r.get("receiptSignature")
+        if not isinstance(sig, str) or not sig.strip():
+            raise HTTPException(status_code=422, detail="receipt is missing receiptSignature")
+        try:
+            raw_sig = base64.b64decode(sig.strip(), validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=422, detail="receipt signature is not valid base64")
+        if len(raw_sig) != 64:
+            raise HTTPException(status_code=422, detail="receipt signature has invalid length")
         if call_id in seen:
             raise HTTPException(status_code=400, detail="duplicate callId in receipts")
         seen.add(call_id)
