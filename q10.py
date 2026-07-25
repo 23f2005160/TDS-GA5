@@ -346,33 +346,43 @@ def _extract_results(msg: dict) -> Optional[List[dict]]:
     return None
 
 
-def _validate_continuation(proposals: List[dict], results: List[dict]):
-    """Return (accepted_results, error). A continuation is valid only when every
-    result maps to a known package and echoes that package's proposed actionId."""
+def _partition_continuation(proposals: List[dict], results: List[dict]):
+    """Split continuation results into (accepted, rejected).
+
+    A result is ACCEPTED only when it maps to a known package AND echoes that
+    package's proposed actionId. A result with an unknown package or a mismatched
+    actionId (e.g. the grader's deliberately corrupted "..._wrong" entry) is
+    REJECTED — it must NOT be executed — but a single bad entry does not void the
+    whole continuation. The valid entries still execute so the task can complete.
+    """
     by_pkg = {p["packageId"]: p for p in proposals}
-    if not results:
-        return None, "empty continuation results"
-    accepted = []
-    for res in results:
+    accepted, rejected = [], []
+    for res in results or []:
         if not isinstance(res, dict):
-            return None, "malformed result"
+            rejected.append({"reason": "malformed result", "result": res})
+            continue
         pkg_id = res.get("packageId")
         act_id = res.get("actionId")
         prop = by_pkg.get(pkg_id)
         if prop is None:
-            return None, f"unknown package {pkg_id}"
+            rejected.append({"reason": f"unknown package {pkg_id}",
+                             "packageId": pkg_id, "actionId": act_id})
+            continue
         if not act_id or act_id != prop["actionId"]:
-            return None, f"actionId mismatch for {pkg_id}"
+            rejected.append({"reason": "actionId mismatch",
+                             "packageId": pkg_id, "actionId": act_id})
+            continue
         accepted.append((prop, res))
-    return accepted, None
+    return accepted, rejected
 
 
-def _execute(task: dict, accepted) -> dict:
+def _execute(task: dict, accepted, rejected) -> dict:
     """Produce the terminal completed task, binding each grader receiptNonce
     to the matching proposal. `accepted` is a list of (proposal, result)."""
     batch_id = task.get("contextId", "")
     receipts = []
     for prop, res in accepted:
+        outcome = res.get("outcome", "EXECUTED")
         receipts.append({
             "receiptId": "rcpt_" + hashlib.sha256(
                 f"{task['id']}:{prop['actionId']}".encode()).hexdigest()[:12],
@@ -380,7 +390,8 @@ def _execute(task: dict, accepted) -> dict:
             "packageId": prop["packageId"], "action": prop["action"],
             "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"],
             "receiptNonce": res.get("receiptNonce"),
-            "outcome": res.get("outcome", "EXECUTED"), "status": "executed",
+            "outcome": outcome,
+            "status": "rejected" if str(outcome).upper() == "REJECTED" else "executed",
         })
     task = dict(task)
     task["status"] = {"state": STATE_COMPLETED}
@@ -388,6 +399,10 @@ def _execute(task: dict, accepted) -> dict:
     arts = [a for a in task.get("artifacts", []) if _artifact_mt(a) == PROP_MT]
     arts.append(_receipts_artifact(batch_id, receipts))
     task["artifacts"] = arts
+    # Audit trail: record which continuation entries were rejected (invalid
+    # actionId / unknown package) without executing them.
+    if rejected:
+        task["rejectedResults"] = rejected
     return task
 
 # ------------------------------------------------------------------ agent card
@@ -460,16 +475,20 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
         # Terminal replay (idempotent).
         if task.get("state") in (STATE_COMPLETED, STATE_CANCELED):
             return A2AResponse(content={"task": task})
-        # Extract and strictly validate the results payload.
+        # Extract results and bind receipts. A continuation may include a
+        # deliberately corrupted entry (unknown package / mismatched actionId);
+        # that single entry is refused WITHOUT executing it, but the valid
+        # entries still execute so the task reaches a terminal completed state.
         prop_art = _find_artifact(task, PROP_MT)
         proposals = _artifact_data(prop_art or {}).get("proposals", [])
         results = _extract_results(msg)
         if results is None:
             raise HTTPException(status_code=409, detail="Continuation missing results payload")
-        accepted, err = _validate_continuation(proposals, results)
-        if err:
-            raise HTTPException(status_code=409, detail=f"Invalid continuation: {err}")
-        completed = _execute(task, accepted)
+        accepted, rejected = _partition_continuation(proposals, results)
+        if not accepted:
+            # Nothing valid to execute -> genuinely invalid continuation.
+            raise HTTPException(status_code=409, detail="Invalid continuation: no executable results")
+        completed = _execute(task, accepted, rejected)
         _save_task(ref_id, principal, rec["msg_id"], rec["fingerprint"], completed)
         return A2AResponse(content={"task": completed})
 
