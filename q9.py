@@ -797,6 +797,14 @@ async def do_propose(body):
     # tests against the whole request, while commit re-derives digest(dossiers)
     # from the stored response's inputDigest field (unchanged contract).
     put_eval(eval_id, conflict_key, response)
+    # Persist the receipt-verifier public key ONLY on the genuinely-new-eval
+    # path (a conflict probe raises 409 above, before reaching here, so it can
+    # never overwrite the real key). Commit reloads this to verify signatures.
+    verifier = body.get("receiptVerifier")
+    if isinstance(verifier, dict):
+        jwk = verifier.get("publicKeyJwk")
+        if isinstance(jwk, dict):
+            put_verifier(eval_id, jwk)
     return response
 
 def validate_commit(body):
