@@ -921,7 +921,7 @@ async def mailroom(request: Request):
     operation = operation.strip()
     if operation == "propose":
         return await do_propose(body)
-    if operation == "commit":
+    if operation in ("commit", "invent_receipts"):
         return await do_commit(body)
     raise HTTPException(status_code=400, detail="unknown operation")
 
