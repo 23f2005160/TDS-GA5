@@ -69,7 +69,7 @@ async def log_requests(request: Request, call_next):
             "method": request.method,
             "url": str(request.url),
             "headers": dict(request.headers),
-            "body": body_str[:1000],
+            "body": body_str[:500000],
             "status_code": 500,
             "duration_ms": round((time.time() - start_time) * 1000, 2),
             "error": str(e)
@@ -94,7 +94,7 @@ async def log_requests(request: Request, call_next):
         "method": request.method,
         "url": str(request.url),
         "headers": dict(request.headers),
-        "body": body_str[:1000],
+        "body": body_str[:500000],
         "status_code": response.status_code,
         "duration_ms": duration,
         "error": None
