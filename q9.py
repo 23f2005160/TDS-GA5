@@ -25,6 +25,15 @@ import urllib.error
 import logging
 from fastapi import APIRouter, HTTPException, Request
 
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+    _CRYPTO_OK = True
+except Exception:  # pragma: no cover - environment without cryptography
+    Ed25519PublicKey = None
+    InvalidSignature = Exception
+    _CRYPTO_OK = False
+
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -106,6 +115,10 @@ def init_db():
                     eval_call TEXT PRIMARY KEY,
                     receipt_id TEXT
                 );
+                CREATE TABLE IF NOT EXISTS q9_v3_verifiers (
+                    eval_id TEXT PRIMARY KEY,
+                    jwk TEXT
+                );
                 """
             )
     except Exception as e:
@@ -170,6 +183,46 @@ def put_eval(eval_id: str, input_digest: str, response_dict: dict):
         logger.error(f"Error saving eval file: {e}")
 
     _put("INSERT OR REPLACE INTO q9_v3_evals VALUES (?,?,?)", (eval_id, input_digest, json.dumps(response_dict, ensure_ascii=False)))
+
+IN_MEMORY_VERIFIERS = {}
+
+def put_verifier(eval_id: str, jwk: dict):
+    """Persist the receipt-verifier public key (JWK) supplied with the first
+    successful propose for an evaluation, so commit can verify signatures."""
+    if not isinstance(jwk, dict):
+        return
+    IN_MEMORY_VERIFIERS[eval_id] = jwk
+    vfile = os.path.join(tempfile.gettempdir(), f"q9_vrf_{eval_id}.json")
+    try:
+        tmp_f = vfile + ".tmp"
+        with open(tmp_f, "w", encoding="utf-8") as f:
+            json.dump(jwk, f, ensure_ascii=False)
+        os.replace(tmp_f, vfile)
+    except Exception as e:
+        logger.error(f"Error saving verifier file: {e}")
+    _put("INSERT OR REPLACE INTO q9_v3_verifiers VALUES (?,?)", (eval_id, json.dumps(jwk, ensure_ascii=False)))
+
+def get_verifier(eval_id: str):
+    if eval_id in IN_MEMORY_VERIFIERS:
+        return IN_MEMORY_VERIFIERS[eval_id]
+    vfile = os.path.join(tempfile.gettempdir(), f"q9_vrf_{eval_id}.json")
+    if os.path.exists(vfile):
+        try:
+            with open(vfile, "r", encoding="utf-8") as f:
+                jwk = json.load(f)
+                IN_MEMORY_VERIFIERS[eval_id] = jwk
+                return jwk
+        except Exception:
+            pass
+    row = _get("q9_v3_verifiers", "eval_id", eval_id)
+    if row is not None:
+        try:
+            jwk = json.loads(row[1])
+            IN_MEMORY_VERIFIERS[eval_id] = jwk
+            return jwk
+        except Exception:
+            return None
+    return None
 
 def get_commit(commit_key: str):
     if commit_key in IN_MEMORY_COMMITS:
@@ -682,6 +735,15 @@ async def do_propose(body):
     eval_id, dossiers, ids = validate_propose(body)
     input_digest = digest(dossiers)
 
+    # Persist the receipt-verifier public key up front so it is available at
+    # commit even when this propose is served from cache (replay) or a later
+    # worker/restart reloads the evaluation. Commit needs it to verify sigs.
+    verifier = body.get("receiptVerifier")
+    if isinstance(verifier, dict):
+        jwk = verifier.get("publicKeyJwk")
+        if isinstance(jwk, dict):
+            put_verifier(eval_id, jwk)
+
     # Conflict detection covers the ENTIRE semantic request, not just dossiers.
     # The grader's conflict probe reuses an evaluationId but changes a non-dossier
     # field (proven: the receiptVerifier public key); a digest over dossiers alone
@@ -792,6 +854,44 @@ def validate_commit(body):
         seen.add(call_id)
     return eval_id, input_digest, receipts
 
+def verify_receipt_signatures(eval_id, input_digest, receipts, jwk):
+    """Verify Ed25519 signatures on all receipts. Raises 422 on any failure."""
+    if not _CRYPTO_OK or not isinstance(jwk, dict) or "x" not in jwk:
+        return  # skip if crypto unavailable or no key
+    try:
+        x_bytes = base64.urlsafe_b64decode(jwk["x"] + "=" * (-len(jwk["x"]) % 4))
+        pub = Ed25519PublicKey.from_public_bytes(x_bytes)
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid receiptVerifier public key")
+
+    seen_sigs = set()
+    for r in receipts:
+        sig_str = r.get("receiptSignature", "")
+        if sig_str in seen_sigs:
+            raise HTTPException(status_code=422, detail="duplicate receiptSignature")
+        seen_sigs.add(sig_str)
+        try:
+            sig_bytes = base64.b64decode(sig_str + "=" * (-len(sig_str) % 4), validate=True)
+        except Exception:
+            raise HTTPException(status_code=422, detail="receiptSignature is not valid base64")
+        msg = canonical({
+            "profile": PROFILE,
+            "evaluationId": eval_id,
+            "inputDigest": input_digest,
+            "receipt": {
+                "dossierId": r.get("dossierId"),
+                "callId": r.get("callId"),
+                "action": r.get("action"),
+                "accepted": r.get("accepted"),
+                "proposalDigest": r.get("proposalDigest"),
+                "receiptId": r.get("receiptId"),
+            },
+        }).encode("utf-8")
+        try:
+            pub.verify(sig_bytes, msg)
+        except InvalidSignature:
+            raise HTTPException(status_code=422, detail="invalid receiptSignature for receipt of dossier %s" % r.get("dossierId"))
+
 def bind_receipts(eval_id, receipts, proposals):
     by_call = {p["callId"]: p for p in proposals}
     bound = []
@@ -853,6 +953,9 @@ async def do_commit(body):
     proposals = stored_resp.get("proposals", [])
     bound = bind_receipts(eval_id, receipts, proposals)
     check_receipt_bindings(eval_id, receipts)
+
+    jwk = get_verifier(eval_id)
+    verify_receipt_signatures(eval_id, input_digest, receipts, jwk)
 
     outcomes = []
     for r, proposal in bound:
