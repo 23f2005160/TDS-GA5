@@ -225,8 +225,11 @@ def _build_proposals(packages: List[dict]) -> List[dict]:
         dec = _decide(pkg)
         pid = "prop_" + hashlib.sha256(
             f"{pkg_id}:{dec['action']}".encode()).hexdigest()[:12]
+        aid = "act_" + hashlib.sha256(
+            f"{pkg_id}:{dec['action']}".encode()).hexdigest()[:12]
         proposals.append({
-            "proposalId": pid, "packageId": pkg_id, "action": dec["action"],
+            "proposalId": pid, "actionId": aid,
+            "packageId": pkg_id, "action": dec["action"],
             "rationale": dec["rationale"], "facts": dec["facts"],
             "evidenceRefs": dec["evidenceRefs"],
         })
@@ -272,51 +275,55 @@ def _find_continuation_ref(msg: dict, body: dict) -> Optional[str]:
     return None
 
 
-def _requested_proposal_ids(msg: dict, body: dict) -> Optional[List[str]]:
-    """Return the proposalIds the caller accepts, or None to mean 'accept all'."""
-    acc = []
-    found = False
+def _extract_results(msg: dict) -> Optional[List[dict]]:
+    """Pull the grader's action-results list from the continuation, or None."""
     for p in msg.get("parts", []):
         data = p.get("data") or {}
-        for key in ("acceptedProposalIds", "proposalIds", "accepted"):
+        if isinstance(data.get("results"), list):
+            return data["results"]
+        # tolerate alternate keys
+        for key in ("actionResults", "decisions"):
             if isinstance(data.get(key), list):
-                found = True
-                for x in data[key]:
-                    if isinstance(x, str):
-                        acc.append(x)
-                    elif isinstance(x, dict) and x.get("proposalId"):
-                        acc.append(x["proposalId"])
-        for key in ("decisions", "proposals"):
-            if isinstance(data.get(key), list):
-                found = True
-                for d in data[key]:
-                    if not isinstance(d, dict):
-                        continue
-                    dec = str(d.get("decision") or d.get("status") or "accept").lower()
-                    if d.get("proposalId") and dec in ("accept", "accepted", "approve", "approved"):
-                        acc.append(d["proposalId"])
-    return acc if found else None
+                return data[key]
+    return None
 
 
-def _execute(task: dict, accepted_ids: Optional[List[str]]) -> dict:
-    """Produce the terminal completed task; receipts only for accepted proposals."""
-    prop_art = next((a for a in task.get("artifacts", [])
-                     if a.get("mediaType") == PROP_MT), None)
-    proposals = (prop_art or {}).get("data", {}).get("proposals", [])
+def _validate_continuation(proposals: List[dict], results: List[dict]):
+    """Return (accepted_results, error). A continuation is valid only when every
+    result maps to a known package and echoes that package's proposed actionId."""
+    by_pkg = {p["packageId"]: p for p in proposals}
+    if not results:
+        return None, "empty continuation results"
+    accepted = []
+    for res in results:
+        if not isinstance(res, dict):
+            return None, "malformed result"
+        pkg_id = res.get("packageId")
+        act_id = res.get("actionId")
+        prop = by_pkg.get(pkg_id)
+        if prop is None:
+            return None, f"unknown package {pkg_id}"
+        if not act_id or act_id != prop["actionId"]:
+            return None, f"actionId mismatch for {pkg_id}"
+        accepted.append((prop, res))
+    return accepted, None
+
+
+def _execute(task: dict, accepted) -> dict:
+    """Produce the terminal completed task, binding each grader receiptNonce
+    to the matching proposal. `accepted` is a list of (proposal, result)."""
     batch_id = task.get("contextId", "")
-
     receipts = []
-    for prop in proposals:
-        if accepted_ids is not None and prop["proposalId"] not in accepted_ids:
-            continue
+    for prop, res in accepted:
         receipts.append({
             "receiptId": "rcpt_" + hashlib.sha256(
-                f"{task['id']}:{prop['proposalId']}".encode()).hexdigest()[:12],
-            "proposalId": prop["proposalId"], "packageId": prop["packageId"],
-            "action": prop["action"], "facts": prop["facts"],
-            "evidenceRefs": prop["evidenceRefs"], "status": "executed",
+                f"{task['id']}:{prop['actionId']}".encode()).hexdigest()[:12],
+            "proposalId": prop["proposalId"], "actionId": prop["actionId"],
+            "packageId": prop["packageId"], "action": prop["action"],
+            "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"],
+            "receiptNonce": res.get("receiptNonce"),
+            "outcome": res.get("outcome", "EXECUTED"), "status": "executed",
         })
-
     task = dict(task)
     task["status"] = {"state": STATE_COMPLETED}
     task["state"] = STATE_COMPLETED
@@ -346,7 +353,7 @@ async def agent_card(request: Request):
                        "after continuation, executes one action per invoice claim.",
         "version": "1.0.0",
         "url": base,
-        "preferredTransport": "JSONRPC",
+        "preferredTransport": "HTTP+JSON",
         "defaultInputModes": [CLAIM_MT],
         "defaultOutputModes": [PROP_MT, RCPT_MT],
         "capabilities": {"streaming": False, "pushNotifications": False,
@@ -393,16 +400,16 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
         # Terminal replay (idempotent).
         if task.get("state") in (STATE_COMPLETED, STATE_CANCELED):
             return A2AResponse(content={"task": task})
-        # Validate the accepted proposal ids against what we actually proposed.
+        # Extract and strictly validate the results payload.
         prop_art = next((a for a in task.get("artifacts", [])
                          if a.get("mediaType") == PROP_MT), None)
-        known = {p["proposalId"] for p in (prop_art or {}).get("data", {}).get("proposals", [])}
-        accepted = _requested_proposal_ids(msg, body)
-        if accepted is not None:
-            unknown = [pid for pid in accepted if pid not in known]
-            if unknown:
-                raise HTTPException(status_code=409,
-                                    detail="Continuation references unknown proposals")
+        proposals = (prop_art or {}).get("data", {}).get("proposals", [])
+        results = _extract_results(msg)
+        if results is None:
+            raise HTTPException(status_code=409, detail="Continuation missing results payload")
+        accepted, err = _validate_continuation(proposals, results)
+        if err:
+            raise HTTPException(status_code=409, detail=f"Invalid continuation: {err}")
         completed = _execute(task, accepted)
         _save_task(ref_id, principal, rec["msg_id"], rec["fingerprint"], completed)
         return A2AResponse(content={"task": completed})
