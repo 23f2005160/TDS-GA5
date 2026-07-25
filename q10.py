@@ -17,10 +17,14 @@ A2A_CT = "application/a2a+json"
 CLAIM_MT = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_MT = "application/vnd.ga5.invoice-action-proposals+json"
 RCPT_MT = "application/vnd.ga5.invoice-action-receipts+json"
+RESULTS_MT = "application/vnd.ga5.invoice-action-results+json"
 
-STATE_INPUT = "input-required"
-STATE_COMPLETED = "completed"
-STATE_CANCELED = "canceled"
+STATE_INPUT = "TASK_STATE_INPUT_REQUIRED"
+STATE_WORKING = "TASK_STATE_WORKING"
+STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
+STATE_COMPLETED = "TASK_STATE_COMPLETED"
+STATE_CANCELED = "TASK_STATE_CANCELED"
+TERMINAL_STATES = (STATE_COMPLETED, STATE_CANCELED)
 
 VALID_ACTIONS = ("settle_invoice", "request_approval", "hold_invoice",
                  "open_exception", "reject_duplicate")
@@ -346,37 +350,31 @@ def _extract_results(msg: dict) -> Optional[List[dict]]:
     return None
 
 
-def _partition_continuation(proposals: List[dict], results: List[dict]):
-    """Split continuation results into (accepted, rejected).
-
-    A result is ACCEPTED only when it maps to a known package AND echoes that
-    package's proposed actionId. A result with an unknown package or a mismatched
-    actionId (e.g. the grader's deliberately corrupted "..._wrong" entry) is
-    REJECTED — it must NOT be executed — but a single bad entry does not void the
-    whole continuation. The valid entries still execute so the task can complete.
-    """
+def _validate_continuation(proposals: List[dict], results: List[dict]):
+    """Return (accepted, error). A continuation is valid ONLY when EVERY result
+    maps to a known package and echoes that package's proposed actionId. The
+    grader's negative test sends one deliberately corrupted actionId ("..._wrong")
+    among otherwise-valid entries; that entire continuation must be refused
+    without executing anything, so validation is strictly all-or-nothing."""
     by_pkg = {p["packageId"]: p for p in proposals}
-    accepted, rejected = [], []
-    for res in results or []:
+    if not results:
+        return None, "empty continuation results"
+    accepted = []
+    for res in results:
         if not isinstance(res, dict):
-            rejected.append({"reason": "malformed result", "result": res})
-            continue
+            return None, "malformed result"
         pkg_id = res.get("packageId")
         act_id = res.get("actionId")
         prop = by_pkg.get(pkg_id)
         if prop is None:
-            rejected.append({"reason": f"unknown package {pkg_id}",
-                             "packageId": pkg_id, "actionId": act_id})
-            continue
+            return None, f"unknown package {pkg_id}"
         if not act_id or act_id != prop["actionId"]:
-            rejected.append({"reason": "actionId mismatch",
-                             "packageId": pkg_id, "actionId": act_id})
-            continue
+            return None, f"actionId mismatch for {pkg_id}"
         accepted.append((prop, res))
-    return accepted, rejected
+    return accepted, None
 
 
-def _execute(task: dict, accepted, rejected) -> dict:
+def _execute(task: dict, accepted) -> dict:
     """Produce the terminal completed task, binding each grader receiptNonce
     to the matching proposal. `accepted` is a list of (proposal, result)."""
     batch_id = task.get("contextId", "")
@@ -399,10 +397,6 @@ def _execute(task: dict, accepted, rejected) -> dict:
     arts = [a for a in task.get("artifacts", []) if _artifact_mt(a) == PROP_MT]
     arts.append(_receipts_artifact(batch_id, receipts))
     task["artifacts"] = arts
-    # Audit trail: record which continuation entries were rejected (invalid
-    # actionId / unknown package) without executing them.
-    if rejected:
-        task["rejectedResults"] = rejected
     return task
 
 # ------------------------------------------------------------------ agent card
@@ -410,10 +404,14 @@ def _execute(task: dict, accepted, rejected) -> dict:
 def _base_url(request: Request) -> str:
     env = os.environ.get("RENDER_EXTERNAL_URL")
     if env:
-        return env.rstrip("/")
-    # Derive a clean public HTTPS origin (no creds/query/fragment).
-    host = request.headers.get("host", "tds-ga5.onrender.com")
-    return f"https://{host}"
+        origin = env.rstrip("/")
+    else:
+        # Derive a clean public HTTPS origin (no creds/query/fragment).
+        host = request.headers.get("host", "tds-ga5.onrender.com")
+        origin = f"https://{host}"
+    # The A2A transport lives under /a2a; the card must advertise that base
+    # (with a trailing slash) so the grader resolves message:send/tasks against it.
+    return origin + "/a2a/"
 
 
 @router.get("/.well-known/agent-card.json")
@@ -423,22 +421,39 @@ async def agent_card(request: Request):
     return A2AResponse(content={
         "protocolVersion": "1.0",
         "name": "ga5-invoice-agent",
-        "description": "Autonomous accounts-payable agent that proposes and, "
-                       "after continuation, executes one action per invoice claim.",
+        "description": "Autonomous accounts-payable agent that reads noisy invoice "
+                       "claim batches, proposes exactly one cited action per package, "
+                       "and executes only receipt-accepted proposals on continuation.",
         "version": "1.0.0",
         "url": base,
         "preferredTransport": "HTTP+JSON",
-        "defaultInputModes": [CLAIM_MT],
-        "defaultOutputModes": [PROP_MT, RCPT_MT],
+        "provider": {"organization": "TDS GA5", "url": base},
         "capabilities": {"streaming": False, "pushNotifications": False,
-                         "stateTransitionHistory": True},
+                         "stateTransitionHistory": True, "extendedAgentCard": False},
+        "supportedInterfaces": [
+            {"url": base, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}
+        ],
+        "defaultInputModes": [CLAIM_MT, RESULTS_MT, "application/json"],
+        "defaultOutputModes": [PROP_MT, RCPT_MT, "application/json"],
+        "securitySchemes": {
+            "bearerAuth": {"type": "http", "scheme": "bearer",
+                           "description": "Per-tenant Bearer token; each token is a distinct principal."}
+        },
+        "security": [{"bearerAuth": []}],
         "skills": [{
             "id": "invoice-action",
             "name": "Invoice Claim Action",
             "description": "Reads an invoice claim batch, proposes one cited action "
-                           "per package, and executes accepted proposals on continuation.",
-            "tags": ["invoice", "accounts-payable", "a2a"],
-            "inputModes": [CLAIM_MT],
+                           "per package (settle_invoice, request_approval, hold_invoice, "
+                           "reject_duplicate or open_exception), and executes accepted "
+                           "proposals against grader tool receipts on continuation.",
+            "tags": ["invoice", "accounts-payable", "reconciliation", "approval",
+                     "duplicate-detection", "exception-handling", "a2a"],
+            "examples": [
+                "Propose one action for each package in an invoice claim batch.",
+                "Finalise the approved proposals using these tool receipts.",
+            ],
+            "inputModes": [CLAIM_MT, RESULTS_MT],
             "outputModes": [PROP_MT, RCPT_MT],
         }],
     })
@@ -473,22 +488,20 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
             raise HTTPException(status_code=403, detail="Access denied")
         task = rec["data"]
         # Terminal replay (idempotent).
-        if task.get("state") in (STATE_COMPLETED, STATE_CANCELED):
+        if task.get("state") in TERMINAL_STATES:
             return A2AResponse(content={"task": task})
-        # Extract results and bind receipts. A continuation may include a
-        # deliberately corrupted entry (unknown package / mismatched actionId);
-        # that single entry is refused WITHOUT executing it, but the valid
-        # entries still execute so the task reaches a terminal completed state.
+        # Extract and strictly validate the results payload. The grader's
+        # negative test carries one corrupted actionId; the whole continuation
+        # must then be refused (409) WITHOUT mutating the task.
         prop_art = _find_artifact(task, PROP_MT)
         proposals = _artifact_data(prop_art or {}).get("proposals", [])
         results = _extract_results(msg)
         if results is None:
             raise HTTPException(status_code=409, detail="Continuation missing results payload")
-        accepted, rejected = _partition_continuation(proposals, results)
-        if not accepted:
-            # Nothing valid to execute -> genuinely invalid continuation.
-            raise HTTPException(status_code=409, detail="Invalid continuation: no executable results")
-        completed = _execute(task, accepted, rejected)
+        accepted, err = _validate_continuation(proposals, results)
+        if err:
+            raise HTTPException(status_code=409, detail=f"Invalid continuation: {err}")
+        completed = _execute(task, accepted)
         _save_task(ref_id, principal, rec["msg_id"], rec["fingerprint"], completed)
         return A2AResponse(content={"task": completed})
 
@@ -556,7 +569,7 @@ async def cancel_task(task_id: str, request: Request,
     task = rec["data"]
     # Cancel-vs-result race: if already terminal, return the stored terminal
     # state idempotently rather than overwriting a completed result.
-    if task.get("state") in (STATE_COMPLETED, STATE_CANCELED):
+    if task.get("state") in TERMINAL_STATES:
         return A2AResponse(content=task)
     task = dict(task)
     task["status"] = {"state": STATE_CANCELED}
