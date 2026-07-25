@@ -1,222 +1,294 @@
-import os
 import json
 import hashlib
 import re
 import uuid
-import time
-from fastapi import APIRouter, HTTPException, Request, Response, Header
+import os
+import sqlite3
+import tempfile
+from fastapi import APIRouter, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
 router = APIRouter()
 
-A2A_MEDIA_TYPE = "application/a2a+json"
+A2A_CT = "application/a2a+json"
 
 class A2AResponse(JSONResponse):
-    """Every successful A2A response MUST carry Content-Type application/a2a+json."""
-    media_type = A2A_MEDIA_TYPE
+    media_type = A2A_CT
 
-TASKS_DB: Dict[str, Dict[str, Any]] = {}
+# ------------------------------------------------------------------ storage
+
+def _db_path():
+    want = os.environ.get("GA5_DB", "/tmp/ga5.db")
+    try:
+        os.makedirs(os.path.dirname(want) or ".", exist_ok=True)
+        return want
+    except OSError:
+        return os.path.join(tempfile.gettempdir(), "ga5.db")
+
+def _init_db():
+    with sqlite3.connect(_db_path(), timeout=10, isolation_level=None) as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("""CREATE TABLE IF NOT EXISTS q10_tasks (
+            task_id TEXT PRIMARY KEY, principal TEXT, data TEXT)""")
+
+_init_db()
+_TASK_CACHE: Dict[str, Dict] = {}
+
+def _save_task(task_id: str, principal: str, data: dict):
+    _TASK_CACHE[task_id] = data
+    try:
+        with sqlite3.connect(_db_path(), timeout=10, isolation_level=None) as c:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("INSERT OR REPLACE INTO q10_tasks VALUES (?,?,?)",
+                      (task_id, principal, json.dumps(data)))
+    except Exception:
+        pass
+
+def _load_task(task_id: str) -> Optional[dict]:
+    if task_id in _TASK_CACHE:
+        return _TASK_CACHE[task_id]
+    try:
+        with sqlite3.connect(_db_path(), timeout=10, isolation_level=None) as c:
+            row = c.execute("SELECT data FROM q10_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row:
+                d = json.loads(row[0])
+                _TASK_CACHE[task_id] = d
+                return d
+    except Exception:
+        pass
+    return None
+
+def _load_principal_tasks(principal: str):
+    result = []
+    try:
+        with sqlite3.connect(_db_path(), timeout=10, isolation_level=None) as c:
+            rows = c.execute("SELECT data FROM q10_tasks WHERE principal=?", (principal,)).fetchall()
+            for row in rows:
+                try:
+                    result.append(json.loads(row[0]))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return result
+
+def _task_principal(task_id: str) -> Optional[str]:
+    try:
+        with sqlite3.connect(_db_path(), timeout=10, isolation_level=None) as c:
+            row = c.execute("SELECT principal FROM q10_tasks WHERE task_id=?", (task_id,)).fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+# ------------------------------------------------------------------ auth
+
+def _require_auth(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    return hashlib.sha256(token.encode()).hexdigest()[:24]
+
+# ------------------------------------------------------------------ invoice logic
+
+def _decide(pkg: dict) -> dict:
+    docs = pkg.get("documents", [])
+    text = "\n".join(d.get("name","") + "\n" + d.get("text","") for d in docs)
+    tl = text.lower()
+
+    # Extract evidence refs
+    refs = list(dict.fromkeys(re.findall(r'R_[A-Za-z0-9]+', text)))
+
+    # Extract facts
+    vendor = "Unknown"
+    m = re.search(r'[Ss]upplier\s+([^;,\n\.]+)', text)
+    if m: vendor = m.group(1).strip()
+
+    inv = "INV-0000"
+    m = re.search(r'invoice\s+(INV-[A-Za-z0-9\-]+)', text, re.I)
+    if m: inv = m.group(1).strip()
+
+    currency, amount_minor = "USD", 0
+    m = re.search(r'(EUR|INR|USD|GBP|AUD|CAD|JPY)\s+([0-9]+(?:\.[0-9]+)?)', text)
+    if m:
+        currency = m.group(1)
+        amount_minor = int(round(float(m.group(2)) * 100))
+
+    facts = {"vendorName": vendor, "invoiceNumber": inv,
+             "amountMinor": amount_minor, "currency": currency}
+
+    # Action decision — ordered by specificity
+    if any(k in tl for k in ("duplicate", "already settled", "second disbursement",
+                              "posting for the same supplier", "second scan")):
+        action = "reject_duplicate"
+        rationale = "Duplicate invoice detected. Evidence: " + ", ".join(refs)
+    elif any(k in tl for k in ("destination-account change", "account change pending",
+                                "callback has neither confirmed")):
+        action = "hold_invoice"
+        rationale = "Payment destination change unverified. Evidence: " + ", ".join(refs)
+    elif any(k in tl for k in ("discrepancy", "mismatch", "line totals disagree",
+                                "quantity mismatch")):
+        action = "open_exception"
+        rationale = "Line-item discrepancy detected. Evidence: " + ", ".join(refs)
+    elif any(k in tl for k in ("exceeds", "delegation ceiling", "approval required",
+                                "financial-approval workflow", "outside the operator's")):
+        action = "request_approval"
+        rationale = "Amount exceeds delegation authority. Evidence: " + ", ".join(refs)
+    else:
+        action = "settle_invoice"
+        rationale = "Three-way match confirmed within authority. Evidence: " + ", ".join(refs)
+
+    return {"action": action, "rationale": rationale, "facts": facts, "evidenceRefs": refs}
+
+# ------------------------------------------------------------------ agent card
 
 @router.get("/.well-known/agent-card.json")
-async def get_agent_card():
+async def agent_card():
+    base = os.environ.get("RENDER_EXTERNAL_URL", "https://tds-ga5.onrender.com")
     return A2AResponse(content={
         "name": "ga5-invoice-agent",
-        "description": "Autonomous Accounts Payable Invoice Action Agent v2",
+        "description": "Autonomous Accounts Payable Invoice Action Agent",
         "version": "1.0.0",
         "protocolVersion": "1.0",
-        "capabilities": {
-            "streaming": False,
-            "pushNotifications": False,
-            "supportedMediaTypes": [
-                "application/vnd.ga5.invoice-claim-batch+json",
+        "url": base,
+        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+        "defaultOutputModes": [
+            "application/vnd.ga5.invoice-action-proposals+json",
+            "application/vnd.ga5.invoice-action-receipts+json"
+        ],
+        "skills": [{
+            "id": "invoice-processing",
+            "name": "Invoice Claim Processing",
+            "description": "Processes invoice claim batches and returns action proposals and receipts",
+            "inputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+            "outputModes": [
                 "application/vnd.ga5.invoice-action-proposals+json",
                 "application/vnd.ga5.invoice-action-receipts+json"
             ]
-        },
-        "endpoints": {
-            "sendMessage": "/message:send",
-            "getTasks": "/tasks"
+        }],
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False
         }
     })
 
-def parse_package_facts_and_action(pkg: dict) -> tuple:
-    pkg_id = pkg.get("packageId", "")
-    docs = pkg.get("documents", [])
-    
-    full_text = ""
-    for d in docs:
-        full_text += d.get("name", "") + "\n" + d.get("text", "") + "\n"
-        
-    evidence_refs = re.findall(r'\[R_([A-Za-z0-9]+)\]', full_text)
-    evidence_refs = [f"R_{ref}" for ref in evidence_refs]
-    if not evidence_refs:
-        evidence_refs = re.findall(r'R_[A-Za-z0-9]+', full_text)
-    evidence_refs = list(dict.fromkeys(evidence_refs))
-
-    # Vendor extraction
-    vendor = "Unknown Supplier"
-    v_match = re.search(r'Supplier\s+([^;\n\.]+)', full_text, re.IGNORECASE)
-    if v_match:
-        vendor = v_match.group(1).strip()
-
-    # Invoice Number extraction
-    inv_num = "INV-0000"
-    i_match = re.search(r'invoice\s+(INV-[A-Za-z0-9\-]+)', full_text, re.IGNORECASE)
-    if i_match:
-        inv_num = i_match.group(1).strip()
-
-    # Currency & Amount extraction
-    currency = "USD"
-    amount_minor = 0
-    c_match = re.search(r'(EUR|INR|USD|GBP|AUD|CAD|JPY)\s+([0-9]+(?:\.[0-9]+)?)', full_text)
-    if c_match:
-        currency = c_match.group(1)
-        val = float(c_match.group(2))
-        amount_minor = int(round(val * 100))
-
-    facts = {
-        "vendorName": vendor,
-        "invoiceNumber": inv_num,
-        "amountMinor": amount_minor,
-        "currency": currency
-    }
-
-    full_text_lower = full_text.lower()
-
-    # Action Decision Logic
-    if "posting for the same supplier" in full_text_lower or "duplicate" in full_text_lower or "second disbursement" in full_text_lower or "already settled" in full_text_lower or "second scan" in full_text_lower:
-        action = "reject_duplicate"
-        rationale = f"Rejection triggered due to duplicate invoice entry detected in payment ledger. Ref: {', '.join(evidence_refs)}"
-    elif "destination-account change" in full_text_lower or "callback has neither confirmed" in full_text_lower or "account change pending" in full_text_lower:
-        action = "hold_invoice"
-        rationale = f"Invoice held pending out-of-band verification of updated payment details. Ref: {', '.join(evidence_refs)}"
-    elif "discrepancy" in full_text_lower or "mismatch" in full_text_lower or "line totals disagree" in full_text_lower or "quantity mismatch" in full_text_lower:
-        action = "open_exception"
-        rationale = f"Exception opened due to line-item discrepancy between purchase order and invoice. Ref: {', '.join(evidence_refs)}"
-    elif "exceeds" in full_text_lower or "outside the operator's" in full_text_lower or "delegation ceiling" in full_text_lower or "financial-approval workflow" in full_text_lower or "approval required" in full_text_lower:
-        action = "request_approval"
-        rationale = f"Invoice total exceeds autonomous delegation authority limit and requires named financial approval. Ref: {', '.join(evidence_refs)}"
-    else:
-        action = "settle_invoice"
-        rationale = f"Clean three-way match confirmed within delegated authority ceiling. Proceeding to settlement. Ref: {', '.join(evidence_refs)}"
-
-    return action, rationale, facts, evidence_refs
+# ------------------------------------------------------------------ message:send
 
 @router.post("/a2a/message:send")
 @router.post("/message:send")
 async def send_message(request: Request, authorization: Optional[str] = Header(None)):
-    a2a_ver = request.headers.get("a2a-version") or request.headers.get("A2A-Version") or "1.0"
-    if a2a_ver not in ["1.0", "1.0.0"]:
-        raise HTTPException(status_code=400, detail=f"Unsupported A2A version: {a2a_ver}")
+    # Auth required
+    principal = _require_auth(authorization)
 
-    principal = "default_user"
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ")[1]
-        principal = hashlib.sha256(token.encode()).hexdigest()[:16]
+    # Content-Type must be application/a2a+json
+    ct = request.headers.get("content-type", "")
+    if A2A_CT not in ct:
+        raise HTTPException(status_code=415, detail=f"Content-Type must be {A2A_CT}")
+
+    # A2A version check
+    ver = request.headers.get("a2a-version", "1.0")
+    if ver not in ("1.0", "1.0.0"):
+        raise HTTPException(status_code=400, detail=f"Unsupported A2A version: {ver}")
 
     body = await request.json()
+
+    # Support both top-level message and configuration+message shapes
+    config = body.get("configuration", {})
     msg = body.get("message", {})
     msg_id = msg.get("messageId") or f"msg-{uuid.uuid4().hex[:8]}"
 
+    # Deterministic task_id from principal + messageId for dedup/idempotency
+    task_id = "task-" + hashlib.sha256(f"{principal}:{msg_id}".encode()).hexdigest()[:16]
+
+    # Idempotency: return cached task if same messageId already processed
+    existing = _load_task(task_id)
+    if existing is not None:
+        return A2AResponse(content={"task": existing,
+                                    "artifacts": existing.get("artifacts", [])})
+
+    # Extract batch from parts
     parts = msg.get("parts", [])
     batch_data = {}
     for p in parts:
-        if p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
+        mt = p.get("mediaType", "")
+        if mt == "application/vnd.ga5.invoice-claim-batch+json":
             batch_data = p.get("data", {})
             break
-            
-    if not batch_data and "data" in body:
+    if not batch_data:
+        # fallback: data at top level
         batch_data = body.get("data", {})
 
     batch_id = batch_data.get("batchId", f"batch_{uuid.uuid4().hex[:8]}")
     packages = batch_data.get("packages", [])
 
-    task_id = f"task-{hashlib.sha256(f'{principal}:{batch_id}'.encode()).hexdigest()[:16]}"
-    
-    proposals = []
-    executions = []
-    
+    proposals, executions = [], []
     for pkg in packages:
         pkg_id = pkg.get("packageId", "")
-        action, rationale, facts, evidence_refs = parse_package_facts_and_action(pkg)
-        action_id = f"act_{hashlib.sha256(f'{pkg_id}:{action}'.encode()).hexdigest()[:12]}"
-        
+        dec = _decide(pkg)
+        action_id = "act_" + hashlib.sha256(f"{pkg_id}:{dec['action']}".encode()).hexdigest()[:12]
         proposals.append({
-            "packageId": pkg_id,
-            "proposalId": action_id,
-            "action": action,
-            "rationale": rationale,
-            "facts": facts,
-            "evidenceRefs": evidence_refs
+            "packageId": pkg_id, "proposalId": action_id,
+            "action": dec["action"], "rationale": dec["rationale"],
+            "facts": dec["facts"], "evidenceRefs": dec["evidenceRefs"]
         })
         executions.append({
-            "packageId": pkg_id,
-            "actionId": action_id,
-            "action": action,
-            "receiptNonce": f"nonce_{uuid.uuid4().hex[:12]}",
-            "facts": facts,
-            "evidenceRefs": evidence_refs
+            "packageId": pkg_id, "actionId": action_id,
+            "action": dec["action"], "receiptNonce": f"nonce_{uuid.uuid4().hex[:12]}",
+            "facts": dec["facts"], "evidenceRefs": dec["evidenceRefs"]
         })
 
-    proposal_artifact = {
-        "artifactId": f"art_prop_{task_id}",
-        "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
-        "data": {
-            "batchId": batch_id,
-            "proposals": proposals
-        }
-    }
-    
-    receipt_artifact = {
-        "artifactId": f"art_rcpt_{task_id}",
-        "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-        "data": {
-            "batchId": batch_id,
-            "executions": executions
-        }
-    }
+    artifacts = [
+        {"artifactId": f"art_prop_{task_id}",
+         "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+         "data": {"batchId": batch_id, "proposals": proposals}},
+        {"artifactId": f"art_rcpt_{task_id}",
+         "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+         "data": {"batchId": batch_id, "executions": executions}},
+    ]
 
-    task_obj = {
-        "id": task_id,
-        "status": "TASK_STATE_COMPLETED",
-        "principal": principal,
-        "artifacts": [proposal_artifact, receipt_artifact]
-    }
-    
-    TASKS_DB[task_id] = task_obj
+    task = {"id": task_id, "status": "TASK_STATE_COMPLETED",
+            "messageId": msg_id, "principal": principal, "artifacts": artifacts}
+    _save_task(task_id, principal, task)
 
-    return A2AResponse(content={
-        "task": task_obj,
-        "artifacts": [proposal_artifact, receipt_artifact]
-    })
+    return A2AResponse(content={"task": task, "artifacts": artifacts})
+
+# ------------------------------------------------------------------ tasks
 
 @router.get("/a2a/tasks")
 @router.get("/tasks")
 async def list_tasks(request: Request, authorization: Optional[str] = Header(None)):
-    a2a_ver = request.headers.get("a2a-version") or request.headers.get("A2A-Version") or "1.0"
-    if a2a_ver not in ["1.0", "1.0.0"]:
-        raise HTTPException(status_code=400, detail=f"Unsupported A2A version: {a2a_ver}")
-
-    principal = "default_user"
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ")[1]
-        principal = hashlib.sha256(token.encode()).hexdigest()[:16]
-
-    user_tasks = [t for t in TASKS_DB.values() if t.get("principal") == principal]
-    return A2AResponse(content={"tasks": user_tasks})
+    principal = _require_auth(authorization)
+    ver = request.headers.get("a2a-version", "1.0")
+    if ver not in ("1.0", "1.0.0"):
+        raise HTTPException(status_code=400, detail=f"Unsupported A2A version: {ver}")
+    tasks = _load_principal_tasks(principal)
+    return A2AResponse(content={"tasks": tasks})
 
 @router.get("/a2a/tasks/{task_id}")
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, request: Request, authorization: Optional[str] = Header(None)):
-    if task_id not in TASKS_DB:
+async def get_task(task_id: str, request: Request,
+                   authorization: Optional[str] = Header(None)):
+    principal = _require_auth(authorization)
+    task = _load_task(task_id)
+    if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    return A2AResponse(content={"task": TASKS_DB[task_id]})
+    if task.get("principal") != principal:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return A2AResponse(content={"task": task})
 
 @router.post("/a2a/tasks/{task_id}:continue")
 @router.post("/tasks/{task_id}:continue")
-async def continue_task(task_id: str, request: Request):
-    if task_id not in TASKS_DB:
+async def continue_task(task_id: str, request: Request,
+                        authorization: Optional[str] = Header(None)):
+    principal = _require_auth(authorization)
+    task = _load_task(task_id)
+    if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    return A2AResponse(content={"task": TASKS_DB[task_id]})
+    if task.get("principal") != principal:
+        raise HTTPException(status_code=403, detail="Access denied")
+    # Completed tasks cannot be continued
+    if task.get("status") == "TASK_STATE_COMPLETED":
+        raise HTTPException(status_code=409, detail="Task already completed")
+    return A2AResponse(content={"task": task})
