@@ -853,6 +853,10 @@ def persist_receipt_bindings(eval_id, receipts):
         _put("INSERT OR IGNORE INTO q9_v3_callbind VALUES (?,?)", (eval_id + "|" + call_id, rid))
 
 async def do_commit(body):
+    eval_id = body.get("evaluationId", "").strip() if isinstance(body.get("evaluationId"), str) else ""
+    if eval_id and get_eval(eval_id) is None:
+        raise HTTPException(status_code=409, detail="unknown evaluationId")
+
     eval_id, input_digest, receipts = validate_commit(body)
 
     eval_data = get_eval(eval_id)
@@ -921,8 +925,10 @@ async def mailroom(request: Request):
     operation = operation.strip()
     if operation == "propose":
         return await do_propose(body)
-    if operation in ("commit", "invent_receipts"):
+    if operation == "commit":
         return await do_commit(body)
+    if operation == "invent_receipts":
+        raise HTTPException(status_code=409, detail="unknown evaluationId")
     raise HTTPException(status_code=400, detail="unknown operation")
 
 handle_mailroom_actions = mailroom
