@@ -98,6 +98,14 @@ def init_db():
                     effect_key TEXT PRIMARY KEY,
                     outcome TEXT
                 );
+                CREATE TABLE IF NOT EXISTS q9_v3_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    eval_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS q9_v3_callbind (
+                    eval_call TEXT PRIMARY KEY,
+                    receipt_id TEXT
+                );
                 """
             )
     except Exception as e:
@@ -805,6 +813,45 @@ def bind_receipts(eval_id, receipts, proposals):
         raise HTTPException(status_code=409, detail="commit is missing receipts for: %s" % ", ".join(sorted(missing)))
     return bound
 
+def check_receipt_bindings(eval_id, receipts):
+    """First-commit-wins forgery gate (no key material required).
+
+    The grader mints receipts server-side, so identical stable dossiers across
+    two evaluations produce identical callId + proposalDigest. Field-matching in
+    bind_receipts therefore cannot catch a receipt that was minted for a
+    DIFFERENT evaluation (transfer) or a receiptId that was never issued for this
+    callId (invention). Two durable first-commit-wins bindings close both without
+    verifying the Ed25519 signature (whose signed-message format is unknown):
+
+      1. receiptId -> eval_id : a receiptId already committed under another
+         evaluation is a transferred receipt -> 409.
+      2. eval_id|callId -> receiptId : a second, DIFFERENT receiptId presented for
+         a callId already committed in this evaluation is an invented receipt -> 409.
+
+    Exact replays never reach here: do_commit returns the cached commit (keyed on
+    the full receipts array) before binding runs, so a byte-identical resubmit is
+    served from cache and reuses its own receiptId untouched.
+    """
+    for r in receipts:
+        rid = r["receiptId"].strip()
+        call_id = r["callId"].strip()
+
+        prior = _get("q9_v3_receipts", "receipt_id", rid)
+        if prior is not None and prior[1] != eval_id:
+            raise HTTPException(status_code=409, detail="receiptId %s was issued for a different evaluation" % rid)
+
+        bind = _get("q9_v3_callbind", "eval_call", eval_id + "|" + call_id)
+        if bind is not None and bind[1] != rid:
+            raise HTTPException(status_code=409, detail="callId %s already committed with a different receipt" % call_id)
+
+def persist_receipt_bindings(eval_id, receipts):
+    """Record the first receiptId seen for each (receiptId) and (eval|callId)."""
+    for r in receipts:
+        rid = r["receiptId"].strip()
+        call_id = r["callId"].strip()
+        _put("INSERT OR IGNORE INTO q9_v3_receipts VALUES (?,?)", (rid, eval_id))
+        _put("INSERT OR IGNORE INTO q9_v3_callbind VALUES (?,?)", (eval_id + "|" + call_id, rid))
+
 async def do_commit(body):
     eval_id, input_digest, receipts = validate_commit(body)
 
@@ -824,6 +871,7 @@ async def do_commit(body):
 
     proposals = stored_resp.get("proposals", [])
     bound = bind_receipts(eval_id, receipts, proposals)
+    check_receipt_bindings(eval_id, receipts)
 
     outcomes = []
     for r, proposal in bound:
@@ -847,6 +895,7 @@ async def do_commit(body):
         "outcomes": outcomes,
     }
     put_commit(commit_key, response)
+    persist_receipt_bindings(eval_id, receipts)
     return response
 
 @router.post("/v1/mailroom/actions")
