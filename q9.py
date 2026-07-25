@@ -893,19 +893,23 @@ async def mailroom(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="body must be a JSON object")
 
-    if body.get("profile") != PROFILE:
-        raise HTTPException(status_code=400, detail="unsupported profile")
-
     operation = body.get("operation")
     if not isinstance(operation, str):
         raise HTTPException(status_code=422, detail="operation is required")
     operation = operation.strip()
+
+    if body.get("profile") != PROFILE:
+        # A commit carrying a tampered profile is a forged/invalid receipt batch
+        # (the evaluation was proposed under the real profile), so reject it as a
+        # conflict (409) like the other receipt tampers - not a generic 400.
+        if operation == "commit":
+            raise HTTPException(status_code=409, detail="profile does not match evaluation")
+        raise HTTPException(status_code=400, detail="unsupported profile")
+
     if operation == "propose":
         return await do_propose(body)
     if operation == "commit":
         return await do_commit(body)
-    if operation == "invent_receipts":
-        raise HTTPException(status_code=409, detail="unknown evaluationId")
     raise HTTPException(status_code=400, detail="unknown operation")
 
 handle_mailroom_actions = mailroom
