@@ -5,16 +5,23 @@ import re
 import uuid
 import time
 from fastapi import APIRouter, HTTPException, Request, Response, Header
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
 router = APIRouter()
 
+A2A_MEDIA_TYPE = "application/a2a+json"
+
+class A2AResponse(JSONResponse):
+    """Every successful A2A response MUST carry Content-Type application/a2a+json."""
+    media_type = A2A_MEDIA_TYPE
+
 TASKS_DB: Dict[str, Dict[str, Any]] = {}
 
 @router.get("/.well-known/agent-card.json")
 async def get_agent_card():
-    return {
+    return A2AResponse(content={
         "name": "ga5-invoice-agent",
         "description": "Autonomous Accounts Payable Invoice Action Agent v2",
         "version": "1.0.0",
@@ -32,7 +39,7 @@ async def get_agent_card():
             "sendMessage": "/message:send",
             "getTasks": "/tasks"
         }
-    }
+    })
 
 def parse_package_facts_and_action(pkg: dict) -> tuple:
     pkg_id = pkg.get("packageId", "")
@@ -180,10 +187,10 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
     
     TASKS_DB[task_id] = task_obj
 
-    return {
+    return A2AResponse(content={
         "task": task_obj,
         "artifacts": [proposal_artifact, receipt_artifact]
-    }
+    })
 
 @router.get("/a2a/tasks")
 @router.get("/tasks")
@@ -198,18 +205,18 @@ async def list_tasks(request: Request, authorization: Optional[str] = Header(Non
         principal = hashlib.sha256(token.encode()).hexdigest()[:16]
 
     user_tasks = [t for t in TASKS_DB.values() if t.get("principal") == principal]
-    return {"tasks": user_tasks}
+    return A2AResponse(content={"tasks": user_tasks})
 
 @router.get("/a2a/tasks/{task_id}")
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, request: Request, authorization: Optional[str] = Header(None)):
     if task_id not in TASKS_DB:
         raise HTTPException(status_code=404, detail="Task not found")
-    return {"task": TASKS_DB[task_id]}
+    return A2AResponse(content={"task": TASKS_DB[task_id]})
 
 @router.post("/a2a/tasks/{task_id}:continue")
 @router.post("/tasks/{task_id}:continue")
 async def continue_task(task_id: str, request: Request):
     if task_id not in TASKS_DB:
         raise HTTPException(status_code=404, detail="Task not found")
-    return {"task": TASKS_DB[task_id]}
+    return A2AResponse(content={"task": TASKS_DB[task_id]})
