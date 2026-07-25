@@ -904,6 +904,8 @@ async def mailroom(request: Request):
         return await do_propose(body)
     if operation == "commit":
         return await do_commit(body)
+    if operation == "invent_receipts":
+        raise HTTPException(status_code=409, detail="unknown evaluationId")
     raise HTTPException(status_code=400, detail="unknown operation")
 
 handle_mailroom_actions = mailroom
