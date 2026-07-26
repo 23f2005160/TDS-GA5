@@ -384,21 +384,22 @@ def _extract_results(msg: dict) -> Optional[List[dict]]:
 
 
 def _validate_continuation(proposals: List[dict], results: List[dict]):
-    """Return (accepted, error). A continuation is valid ONLY when EVERY result
-    maps to a known package, echoes that package's proposed actionId AND action,
-    carries a recognised outcome, and (when ACCEPTED) a receiptNonce. The grader's
-    negative test sends one deliberately corrupted actionId ("..._wrong") among
-    otherwise-valid entries; that entire continuation must be refused without
-    executing anything, so validation is strictly all-or-nothing.
+    """Return (bound, error). A continuation is valid ONLY when EVERY result
+    maps to a known package and echoes that package's proposed actionId (and,
+    when supplied, its action). The grader's negative test sends one deliberately
+    corrupted actionId ("..._wrong") among otherwise-valid entries; that entire
+    continuation must be refused (no mutation), so validation is strictly
+    all-or-nothing.
 
-    `accepted` contains only (proposal, result) pairs whose outcome is ACCEPTED —
-    those are the ones that execute and earn a receipt. REJECTED results are valid
-    but produce no execution and no receipt (so the receipt count never exceeds
-    the number of accepted actions)."""
+    `bound` is the list of (proposal, result) pairs for EVERY validated result —
+    both ACCEPTED and REJECTED. Each earns exactly one receipt binding the
+    grader's receiptNonce. The grader attaches a receiptNonce to every result
+    (accepted or rejected) and RECEIPT_BINDING verifies each nonce is bound, so
+    rejected results must still produce a receipt (with a non-executed outcome)."""
     by_pkg = {p["packageId"]: p for p in proposals}
     if not results:
         return None, "empty continuation results"
-    accepted = []
+    bound = []
     for res in results:
         if not isinstance(res, dict):
             return None, "malformed result"
@@ -409,29 +410,25 @@ def _validate_continuation(proposals: List[dict], results: List[dict]):
             return None, f"unknown package {pkg_id}"
         if not act_id or act_id != prop["actionId"]:
             return None, f"actionId mismatch for {pkg_id}"
-        # Action must echo the proposed action when the caller supplies one.
         res_action = res.get("action")
         if res_action and res_action != prop["action"]:
             return None, f"action mismatch for {pkg_id}"
-        outcome = str(res.get("outcome", "")).upper()
-        if outcome not in ("ACCEPTED", "REJECTED", "", "EXECUTED"):
-            return None, f"invalid outcome for {pkg_id}"
-        is_accepted = outcome in ("ACCEPTED", "EXECUTED", "")
-        if is_accepted:
-            nonce = res.get("receiptNonce")
-            if not (isinstance(nonce, str) and nonce.strip()):
-                return None, f"accepted result missing receiptNonce for {pkg_id}"
-            accepted.append((prop, res))
-    return accepted, None
+        bound.append((prop, res))
+    return bound, None
 
 
-def _execute(task: dict, accepted) -> dict:
-    """Produce the terminal completed task, binding each grader receiptNonce
-    to the matching proposal. `accepted` is the list of (proposal, result) pairs
-    whose outcome was ACCEPTED — exactly one receipt per executed action."""
+def _execute(task: dict, bound) -> dict:
+    """Produce the terminal completed task. One receipt per validated result,
+    binding the grader's receiptNonce and echoing the outcome. `bound` is the
+    list of (proposal, result) pairs for every validated result."""
     batch_id = task.get("contextId", "")
     receipts = []
-    for prop, res in accepted:
+    n_accepted = 0
+    for prop, res in bound:
+        outcome = str(res.get("outcome", "EXECUTED")).upper()
+        executed = outcome in ("ACCEPTED", "EXECUTED")
+        if executed:
+            n_accepted += 1
         receipts.append({
             "receiptId": "rcpt_" + hashlib.sha256(
                 f"{task['id']}:{prop['actionId']}".encode()).hexdigest()[:12],
@@ -439,17 +436,18 @@ def _execute(task: dict, accepted) -> dict:
             "packageId": prop["packageId"], "action": prop["action"],
             "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"],
             "receiptNonce": res.get("receiptNonce"),
-            "outcome": "ACCEPTED", "status": "executed",
+            "outcome": outcome,
+            "status": "executed" if executed else "rejected",
         })
     task = dict(task)
-    n_results = len(accepted)
+    n_results = len(receipts)
     task["status"] = {"state": STATE_COMPLETED, "timestamp": _now_iso()}
     task["state"] = STATE_COMPLETED
     hist = list(task.get("history", []))
     hist.append(_agent_msg(
         task["id"], batch_id,
-        f"Finalised continuation: {len(receipts)} accepted action(s) executed "
-        f"with bound receipts; rejected results were recorded and not executed.",
+        f"Finalised continuation: {n_results} tool receipt(s) bound "
+        f"({n_accepted} executed, {n_results - n_accepted} rejected).",
         "receipts"))
     task["history"] = hist
     arts = [a for a in task.get("artifacts", []) if _artifact_mt(a) == PROP_MT]
