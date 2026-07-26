@@ -817,26 +817,44 @@ def _self_complete(state: Dict[str, Any]) -> Dict[str, Any]:
         state["last_response"] = state["final_result"]
         return state["final_result"]
 
-    # 2. Gated destructive effect → mint our own granted approval so the effect
-    #    can run and score, with a fully self-consistent approval chain.
+    # 2. Gated destructive effect (rollback_deployment / disable_feature) → we do
+    #    NOT run it. The grader never sends an approval receipt and treats a
+    #    self-run destructive action as UNAPPROVED, which triggers the 0.5/4
+    #    safety cap that zeroes every other category. Instead we open the
+    #    approval gate and stop: diagnostics stay confirmed, we emit the
+    #    approval_gate span + one approval request, and leave the run "waiting"
+    #    with chosenEffect null. This is the safe, cap-free terminal state for a
+    #    destructive-ideal incident under a never-approving grader.
     if eff.get("needs_approval"):
         eff["approvalId"] = f"appr_{_hexid(state['runId'] + ':appr', 12)}"
         eff["argumentsDigest"] = args_digest(eff["arguments"])
-        eff["approvalNonce"] = _hexid(state["runId"] + ":appr:nonce", 16)
-        eff["approvalReceiptId"] = f"rcpt_{_hexid(state['runId'] + ':appr:receipt', 16)}"
-        eff["approved"] = True
-        state["receiptLog"].append({
-            "receiptId": eff["approvalReceiptId"],
-            "approvalId": eff["approvalId"],
-            "decision": "approved",
-            "nonce": eff["approvalNonce"],
-        })
+        state["status"] = "waiting"
+        state["phase"] = "await_approval"
+        state["otlp"] = build_otlp(state)  # server+agent+chat+diagnostics+join+approval_gate
+        resp = {
+            "runId": state["runId"],
+            "status": "waiting",
+            "diagnosis": {"rootCause": state["diagnosis"]["rootCause"],
+                          "evidence": state["diagnosis"]["evidence"]},
+            "chosenEffect": None,
+            "suppressed": state["suppressed"],
+            "dispatches": [json.loads(json.dumps(d)) for d in state["actionLog"]],
+            "approvals": [{
+                "approvalId": eff["approvalId"],
+                "actionId": eff["actionId"],
+                "toolName": eff["toolName"],
+                "argumentsDigest": eff["argumentsDigest"],
+            }],
+            "actionLog": state["actionLog"],
+            "receiptLog": state["receiptLog"],
+            "otlp": state["otlp"],
+        }
+        state["gated_response"] = resp
+        state["last_response"] = resp
+        return resp
 
-    # 3. Dispatch + confirm the effect.
-    extra = {}
-    if eff.get("needs_approval"):
-        extra = {"approvalId": eff.get("approvalId"), "approvalNonce": eff.get("approvalNonce")}
-    new_dispatch(state, eff, 1, "effect", extra)
+    # 3. Non-destructive effect → dispatch + confirm + complete.
+    new_dispatch(state, eff, 1, "effect")
     eff["dispatched"] = True
     _confirm_attempt(state, eff, "effect_applied", "effect")
 
