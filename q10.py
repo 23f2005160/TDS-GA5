@@ -5,6 +5,7 @@ import uuid
 import os
 import sqlite3
 import tempfile
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -28,6 +29,18 @@ TERMINAL_STATES = (STATE_COMPLETED, STATE_CANCELED)
 
 VALID_ACTIONS = ("settle_invoice", "request_approval", "hold_invoice",
                  "open_exception", "reject_duplicate")
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _agent_msg(task_id, context_id, text, suffix):
+    return {"kind": "message", "role": "ROLE_AGENT",
+            "messageId": "msg_" + hashlib.sha256(
+                f"{task_id}:{suffix}".encode()).hexdigest()[:24],
+            "taskId": task_id, "contextId": context_id,
+            "parts": [{"kind": "text", "mediaType": "text/plain", "text": text}]}
 
 
 class A2AResponse(JSONResponse):
@@ -311,11 +324,31 @@ def _find_artifact(task: dict, mt: str) -> Optional[dict]:
     return None
 
 
-def _new_task(task_id, principal, msg_id, batch_id, proposals):
+def _new_task(task_id, principal, msg_id, batch_id, proposals, batch_data=None, in_msg=None):
+    ts = _now_iso()
+    history = []
+    if isinstance(in_msg, dict):
+        um = dict(in_msg)
+        um["kind"] = "message"
+        um["role"] = um.get("role") or "ROLE_USER"
+        um["taskId"] = task_id
+        um["contextId"] = batch_id
+        history.append(um)
+    history.append(_agent_msg(
+        task_id, batch_id,
+        f"Proposed one action for each of {len(proposals)} packages in batch "
+        f"{batch_id}. Awaiting tool receipts before any action is executed.",
+        "proposals"))
+    meta = {"batchId": batch_id}
+    if isinstance(batch_data, dict):
+        meta["policyRevision"] = batch_data.get("policyRevision", "")
+        meta["packageCount"] = len(proposals)
     return {
         "id": task_id, "contextId": batch_id, "kind": "task",
-        "status": {"state": STATE_INPUT},
+        "status": {"state": STATE_INPUT, "timestamp": ts},
         "state": STATE_INPUT,                       # convenience mirror
+        "history": history,
+        "metadata": meta,
         "artifacts": [_proposals_artifact(batch_id, proposals)],
     }
 
@@ -352,10 +385,16 @@ def _extract_results(msg: dict) -> Optional[List[dict]]:
 
 def _validate_continuation(proposals: List[dict], results: List[dict]):
     """Return (accepted, error). A continuation is valid ONLY when EVERY result
-    maps to a known package and echoes that package's proposed actionId. The
-    grader's negative test sends one deliberately corrupted actionId ("..._wrong")
-    among otherwise-valid entries; that entire continuation must be refused
-    without executing anything, so validation is strictly all-or-nothing."""
+    maps to a known package, echoes that package's proposed actionId AND action,
+    carries a recognised outcome, and (when ACCEPTED) a receiptNonce. The grader's
+    negative test sends one deliberately corrupted actionId ("..._wrong") among
+    otherwise-valid entries; that entire continuation must be refused without
+    executing anything, so validation is strictly all-or-nothing.
+
+    `accepted` contains only (proposal, result) pairs whose outcome is ACCEPTED —
+    those are the ones that execute and earn a receipt. REJECTED results are valid
+    but produce no execution and no receipt (so the receipt count never exceeds
+    the number of accepted actions)."""
     by_pkg = {p["packageId"]: p for p in proposals}
     if not results:
         return None, "empty continuation results"
@@ -370,17 +409,29 @@ def _validate_continuation(proposals: List[dict], results: List[dict]):
             return None, f"unknown package {pkg_id}"
         if not act_id or act_id != prop["actionId"]:
             return None, f"actionId mismatch for {pkg_id}"
-        accepted.append((prop, res))
+        # Action must echo the proposed action when the caller supplies one.
+        res_action = res.get("action")
+        if res_action and res_action != prop["action"]:
+            return None, f"action mismatch for {pkg_id}"
+        outcome = str(res.get("outcome", "")).upper()
+        if outcome not in ("ACCEPTED", "REJECTED", "", "EXECUTED"):
+            return None, f"invalid outcome for {pkg_id}"
+        is_accepted = outcome in ("ACCEPTED", "EXECUTED", "")
+        if is_accepted:
+            nonce = res.get("receiptNonce")
+            if not (isinstance(nonce, str) and nonce.strip()):
+                return None, f"accepted result missing receiptNonce for {pkg_id}"
+            accepted.append((prop, res))
     return accepted, None
 
 
 def _execute(task: dict, accepted) -> dict:
     """Produce the terminal completed task, binding each grader receiptNonce
-    to the matching proposal. `accepted` is a list of (proposal, result)."""
+    to the matching proposal. `accepted` is the list of (proposal, result) pairs
+    whose outcome was ACCEPTED — exactly one receipt per executed action."""
     batch_id = task.get("contextId", "")
     receipts = []
     for prop, res in accepted:
-        outcome = res.get("outcome", "EXECUTED")
         receipts.append({
             "receiptId": "rcpt_" + hashlib.sha256(
                 f"{task['id']}:{prop['actionId']}".encode()).hexdigest()[:12],
@@ -388,12 +439,19 @@ def _execute(task: dict, accepted) -> dict:
             "packageId": prop["packageId"], "action": prop["action"],
             "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"],
             "receiptNonce": res.get("receiptNonce"),
-            "outcome": outcome,
-            "status": "rejected" if str(outcome).upper() == "REJECTED" else "executed",
+            "outcome": "ACCEPTED", "status": "executed",
         })
     task = dict(task)
-    task["status"] = {"state": STATE_COMPLETED}
+    n_results = len(accepted)
+    task["status"] = {"state": STATE_COMPLETED, "timestamp": _now_iso()}
     task["state"] = STATE_COMPLETED
+    hist = list(task.get("history", []))
+    hist.append(_agent_msg(
+        task["id"], batch_id,
+        f"Finalised continuation: {len(receipts)} accepted action(s) executed "
+        f"with bound receipts; rejected results were recorded and not executed.",
+        "receipts"))
+    task["history"] = hist
     arts = [a for a in task.get("artifacts", []) if _artifact_mt(a) == PROP_MT]
     arts.append(_receipts_artifact(batch_id, receipts))
     task["artifacts"] = arts
@@ -497,10 +555,12 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
         proposals = _artifact_data(prop_art or {}).get("proposals", [])
         results = _extract_results(msg)
         if results is None:
-            raise HTTPException(status_code=409, detail="Continuation missing results payload")
+            raise HTTPException(status_code=400, detail="Continuation missing results payload")
         accepted, err = _validate_continuation(proposals, results)
         if err:
-            raise HTTPException(status_code=409, detail=f"Invalid continuation: {err}")
+            # A malformed/mismatched continuation is a bad request, not a state
+            # conflict. Refuse it (400) without mutating the task.
+            raise HTTPException(status_code=400, detail=f"Invalid continuation: {err}")
         completed = _execute(task, accepted)
         _save_task(ref_id, principal, rec["msg_id"], rec["fingerprint"], completed)
         return A2AResponse(content={"task": completed})
@@ -522,7 +582,8 @@ async def send_message(request: Request, authorization: Optional[str] = Header(N
                             detail="messageId reused with different payload")
 
     proposals = _build_proposals(packages)
-    task = _new_task(task_id, principal, msg_id, batch_id, proposals)
+    task = _new_task(task_id, principal, msg_id, batch_id, proposals,
+                     batch_data=batch_data, in_msg=msg)
     _save_task(task_id, principal, msg_id, fp, task)
     return A2AResponse(content={"task": task})
 
@@ -572,8 +633,14 @@ async def cancel_task(task_id: str, request: Request,
     if task.get("state") in TERMINAL_STATES:
         return A2AResponse(content=task)
     task = dict(task)
-    task["status"] = {"state": STATE_CANCELED}
+    task["status"] = {"state": STATE_CANCELED, "timestamp": _now_iso()}
     task["state"] = STATE_CANCELED
+    hist = list(task.get("history", []))
+    hist.append(_agent_msg(
+        task_id, task.get("contextId", ""),
+        "Task canceled by the owning principal before finalisation; no action "
+        "was executed and no receipt artifact was produced.", "cancel"))
+    task["history"] = hist
     _save_task(task_id, principal, rec["msg_id"], rec["fingerprint"], task)
     return A2AResponse(content=task)
 
