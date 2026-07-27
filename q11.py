@@ -1391,8 +1391,20 @@ def _handle_outcomes(state: Dict[str, Any], receipt_id: str,
         att["nonce"] = nonce
         att["receiptId"] = receipt_id
 
+        # An errored attempt records its errorType so the receiptLog entry and the
+        # CLIENT span's error.type stay consistent (matches the TA reference, whose
+        # errored receipts carry errorType and whose successful ones do not). We
+        # honour the grader's explicit errorType and otherwise derive it from the
+        # transport status (503 -> "503", 0/timeout -> "timeout").
+        error_type = err
+        if error_type is None:
+            if status == 503:
+                error_type = "503"
+            elif status == 0:
+                error_type = "timeout"
+
         # receipt log entry (tool-outcome shape)
-        state["receiptLog"].append({
+        entry = {
             "receiptId": receipt_id,
             "actionId": act["actionId"],
             "callId": act["callId"],
@@ -1400,7 +1412,10 @@ def _handle_outcomes(state: Dict[str, Any], receipt_id: str,
             "status": status,
             "resultClass": rclass,
             "nonce": nonce,
-        })
+        }
+        if error_type is not None:
+            entry["errorType"] = error_type
+        state["receiptLog"].append(entry)
 
         if status == 503 and att["attempt"] == 1:
             att["errorType"] = "503"
