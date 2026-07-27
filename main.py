@@ -89,6 +89,25 @@ async def log_requests(request: Request, call_next):
         raise e
 
     duration = round((time.time() - start_time) * 1000, 2)
+    # Capture response body for Q11 routes so we can diff what we actually returned
+    resp_body_str = None
+    path = request.url.path
+    if "/v2/incidents" in path or "/q11" in path:
+        try:
+            resp_chunks = []
+            async for chunk in response.body_iterator:
+                resp_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+            resp_body_bytes = b"".join(resp_chunks)
+            resp_body_str = resp_body_bytes.decode("utf-8", errors="ignore")
+            from fastapi.responses import Response as FResponse
+            response = FResponse(
+                content=resp_body_bytes,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+        except Exception:
+            pass
     log_entry = {
         "timestamp": time.time(),
         "method": request.method,
@@ -97,7 +116,8 @@ async def log_requests(request: Request, call_next):
         "body": body_str[:500000],
         "status_code": response.status_code,
         "duration_ms": duration,
-        "error": None
+        "error": None,
+        "response_body": resp_body_str,
     }
     
     path = request.url.path
@@ -177,7 +197,7 @@ FALLBACK_CONFIG = {
 
 def load_student_config():
     global CONFIG
-    email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL")
+    email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL") or "23f2005160@ds.study.iitm.ac.in"
     dir_path = os.path.dirname(os.path.abspath(__file__))
     for cmd in ["node", "nodejs"]:
         try:
