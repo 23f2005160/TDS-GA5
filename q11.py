@@ -843,11 +843,9 @@ def build_otlp(state: Dict[str, Any]) -> Dict[str, Any]:
                 attrs.append(_attr("http.response.status_code", 503))
                 attrs.append(_attr("error.type", "503"))
                 span_status = STATUS_ERROR
-                exec_status = STATUS_ERROR
             elif att.get("errorType") == "timeout":
                 attrs.append(_attr("error.type", "timeout"))
                 span_status = STATUS_ERROR
-                exec_status = STATUS_ERROR
             else:
                 attrs.append(_attr("http.response.status_code", int(att.get("status", 200) or 200)))
             client_spans.append({
@@ -857,6 +855,12 @@ def build_otlp(state: Dict[str, Any]) -> Dict[str, Any]:
                 "status": {"code": span_status},
                 "attributes": attrs,
             })
+        # The execute_tool span reflects the action's FINAL outcome, not any
+        # transient failure: a 503 recovered by a successful retry leaves the
+        # action OK (the reference marks it status 1), while an unrecovered error
+        # (a timeout, or a last attempt that still errored) marks it ERROR.
+        if act["attempts"] and act["attempts"][-1].get("errorType"):
+            exec_status = STATUS_ERROR
         exec_end = ts()
         spans.append({
             "traceId": trace_id, "spanId": exec_id, "parentSpanId": agent_id,
@@ -894,7 +898,11 @@ def build_otlp(state: Dict[str, Any]) -> Dict[str, Any]:
         })
 
     # approval_gate — records approval id + approval receipt nonce; has status.
-    if eff and eff.get("needs_approval"):
+    # Emitted only when the effect actually reached the approval stage (an
+    # approvalId was minted). A destructive effect that was SUPPRESSED (e.g. a
+    # diagnostic timed out) never reaches the gate, so — matching the reference —
+    # no approval_gate span is produced.
+    if eff and eff.get("needs_approval") and eff.get("approvalId"):
         gate_id = span_id_for(run_id, "approval")
         g_start = ts()
         g_end = ts()
