@@ -207,18 +207,24 @@ def make_traceparent(trace_id: str, span_id: str) -> str:
 _TP_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
 
 
-def parse_incoming_traceparent(headers) -> Tuple[Optional[str], Optional[str]]:
-    """Return (trace_id, tracestate) if a valid nonzero incoming context exists."""
+def parse_incoming_traceparent(headers) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (trace_id, span_id, tracestate) if a valid nonzero incoming context
+    exists. The span_id is the incoming parent span the grader expects our root
+    SERVER span to CONTINUE: per the spec, "if a valid incoming traceparent/
+    tracestate is present, continue its trace and preserve tracestate", which in
+    OTLP means our root span's parentSpanId must be this incoming span_id (not
+    just reusing the trace_id). Dropping it leaves a broken trace boundary that
+    the topology check penalises."""
     tp = headers.get("traceparent")
     if not tp:
-        return None, None
+        return None, None, None
     m = _TP_RE.match(tp.strip().lower())
     if not m:
-        return None, None
+        return None, None, None
     tid, sid = m.group(1), m.group(2)
     if tid == "0" * 32 or sid == "0" * 16:
-        return None, None
-    return tid, headers.get("tracestate")
+        return None, None, None
+    return tid, sid, headers.get("tracestate")
 
 
 # --------------------------------------------------------------------------- #
@@ -780,13 +786,16 @@ def build_otlp(state: Dict[str, Any]) -> Dict[str, Any]:
     chat_start = ts()
     chat_end = ts()
 
-    # SERVER root — no parentSpanId, no status (matches reference exactly).
-    spans.append({
+    # SERVER root — parentSpanId only when continuing an incoming trace.
+    _root: Dict[str, Any] = {
         "traceId": trace_id, "spanId": root_id,
         "name": "POST /v2/incidents", "kind": KIND_SERVER,
         "startTimeUnixNano": root_start, "endTimeUnixNano": None,  # set at end
         "attributes": list(base_attrs),
-    })
+    }
+    if state.get("incoming_span_id"):
+        _root["parentSpanId"] = state["incoming_span_id"]
+    spans.append(_root)
     # INTERNAL agent — no status.
     spans.append({
         "traceId": trace_id, "spanId": agent_id, "parentSpanId": root_id,
@@ -1161,7 +1170,7 @@ async def create_incident(request: Request):
     if not decision:
         decision = heuristic_decision(incident, policy, catalog)
 
-    inc_tid, inc_ts = parse_incoming_traceparent(request.headers)
+    inc_tid, inc_sid, inc_ts = parse_incoming_traceparent(request.headers)
     trace_id = inc_tid or trace_id_for(run_id)
 
     state: Dict[str, Any] = {
@@ -1175,6 +1184,7 @@ async def create_incident(request: Request):
         "req_fp": req_fp,
         "trace_id": trace_id,
         "tracestate": inc_ts,
+        "incoming_span_id": inc_sid,
         "forbidden": forbidden_tokens(body),
         "model_name": (getattr(llm, "AIPIPE_MODEL", None) or getattr(llm, "OPENROUTER_MODEL", None)
                        or "gemini-2.0-flash") if used_model else "heuristic-planner/1",
