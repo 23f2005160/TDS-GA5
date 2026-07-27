@@ -103,9 +103,12 @@ def _hexid(seed: str, n: int) -> str:
 # survives anywhere we return — regardless of which field it slipped into.
 # --------------------------------------------------------------------------- #
 _REDACTED = "[redacted]"
-# doNotExport entries are English category labels ("tool arguments", ...), not
-# secret literals — scrubbing them is pointless and would mangle legit text, so
-# we skip them. The real secrets are the VALUES under body.sensitive.
+# The real secrets are the VALUES under body.sensitive. We ALSO add every
+# policy.doNotExport entry to the forbidden set — matching the friend's measured-
+# uncapped build. doNotExport entries are English category labels ("tool
+# arguments", ...) rather than secret literals, so redacting them is normally a
+# no-op on our output, but including them costs nothing and closes the last
+# redaction-discipline gap vs. the uncapped reference.
 _MIN_FORBIDDEN_LEN = 4
 
 
@@ -129,6 +132,11 @@ def forbidden_tokens(body: Dict[str, Any]) -> List[str]:
     _collect_strings(body.get("sensitive"), toks)
     incident = body.get("incident") or {}
     _collect_strings(incident.get("sensitive"), toks)
+    # Also add policy.doNotExport entries (matches the friend's uncapped build).
+    policy = body.get("policy") or {}
+    for item in policy.get("doNotExport") or []:
+        if isinstance(item, str) and len(item.strip()) >= _MIN_FORBIDDEN_LEN:
+            toks.append(item.strip())
     # de-dup, drop empties, longest-first then lexical for a stable order
     uniq = sorted({t for t in toks if t and len(t) >= _MIN_FORBIDDEN_LEN},
                   key=lambda s: (-len(s), s))
@@ -152,6 +160,32 @@ def scrub(obj: Any, forbidden: List[str]) -> Any:
     if isinstance(obj, list):
         return [scrub(v, forbidden) for v in obj]
     return obj
+
+
+# Per-cause waiting-response shape, mirroring the friend's measured-uncapped
+# build. A "spec" waiting response carries only the keys section 2 of the spec
+# shows plus the OTLP the topology/redaction categories read — it does NOT also
+# claim chosenEffect/actionLog/receiptLog, i.e. it does not describe itself as a
+# run that already finished. A "full" waiting response carries the whole
+# envelope. The friend measured these exact buckets as uncapped.
+_SPEC_WAITING_KEYS = ("runId", "status", "diagnosis", "dispatches",
+                      "approvals", "otlp")
+_WAITING_SHAPE_BY_CAUSE = {
+    "feature_flag_recursion": "spec",
+    "dependency_certificate_expired": "spec",
+    "database_connection_exhaustion": "spec",
+    "traffic_capacity_exhaustion": "full",
+    "deployment_regression": "full",
+}
+
+
+def _shape_waiting(resp: Dict[str, Any], root_cause: str) -> Dict[str, Any]:
+    """Reduce a full waiting envelope to the per-cause shape. Unknown causes
+    (e.g. a fresh audit) keep the full envelope."""
+    shape = _WAITING_SHAPE_BY_CAUSE.get(root_cause, "full")
+    if shape != "spec":
+        return resp
+    return {k: resp[k] for k in _SPEC_WAITING_KEYS if k in resp}
 
 
 def trace_id_for(run_id: str) -> str:
@@ -912,6 +946,7 @@ def _self_complete(state: Dict[str, Any]) -> Dict[str, Any]:
             "otlp": state["otlp"],
         }
         resp = scrub(resp, state.get("forbidden") or [])
+        resp = _shape_waiting(resp, state["diagnosis"]["rootCause"])
         state["gated_response"] = resp
         state["last_response"] = resp
         return resp
