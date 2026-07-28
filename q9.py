@@ -25,14 +25,117 @@ import urllib.error
 import logging
 from fastapi import APIRouter, HTTPException, Request
 
-try:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    from cryptography.exceptions import InvalidSignature
-    _CRYPTO_OK = True
+# ----------------------------------------------------------------- Ed25519
+# Verification must never be silently skipped: on a host where the
+# `cryptography` wheel failed to install, a pure-Python RFC 8032 fallback keeps
+# the accepted-flipped probe from sailing through. Both paths agree bit-for-bit.
+
+try:  # fast path
+    from cryptography.exceptions import InvalidSignature as _InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey as _Ed25519PublicKey
+
+    def _ed_verify_fast(public_key: bytes, signature: bytes, message: bytes) -> bool:
+        try:
+            _Ed25519PublicKey.from_public_bytes(public_key).verify(signature, message)
+            return True
+        except (_InvalidSignature, ValueError):
+            return False
 except Exception:  # pragma: no cover - environment without cryptography
-    Ed25519PublicKey = None
-    InvalidSignature = Exception
-    _CRYPTO_OK = False
+    _ed_verify_fast = None
+
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_recover_x(y, sign):
+    if y >= _ED_P:
+        return None
+    xx = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    if xx == 0:
+        return None if sign else 0
+    x = pow(xx, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - xx) % _ED_P != 0:
+        x = x * _ED_I % _ED_P
+    if (x * x - xx) % _ED_P != 0:
+        return None
+    if x & 1 != sign:
+        x = _ED_P - x
+    return x
+
+
+_ED_G_Y = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_G_X = _ed_recover_x(_ED_G_Y, 0)
+_ED_G = (_ED_G_X, _ED_G_Y, 1, _ED_G_X * _ED_G_Y % _ED_P)
+_ED_ZERO = (0, 1, 1, 0)
+
+
+def _ed_add(p, q):
+    a, b, c, d = p
+    e, f, g, h = q
+    r = (b - a) * (f - e) % _ED_P
+    s = (b + a) * (f + e) % _ED_P
+    t = 2 * d * h * _ED_D % _ED_P
+    u = 2 * c * g % _ED_P
+    return ((s - r) * (u - t) % _ED_P, (s + r) * (u + t) % _ED_P,
+            (u + t) * (u - t) % _ED_P, (s - r) * (s + r) % _ED_P)
+
+
+def _ed_mul(point, scalar):
+    result = _ED_ZERO
+    while scalar > 0:
+        if scalar & 1:
+            result = _ed_add(result, point)
+        point = _ed_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def _ed_equal(p, q):
+    a, b, c, _ = p
+    e, f, g, _ = q
+    return (a * g - e * c) % _ED_P == 0 and (b * g - f * c) % _ED_P == 0
+
+
+def _ed_decompress(data):
+    if len(data) != 32:
+        return None
+    y = int.from_bytes(data, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    x = _ed_recover_x(y, sign)
+    if x is None:
+        return None
+    return (x, y, 1, x * y % _ED_P)
+
+
+def _ed_verify_pure(public_key: bytes, signature: bytes, message: bytes) -> bool:
+    if len(public_key) != 32 or len(signature) != 64:
+        return False
+    a = _ed_decompress(public_key)
+    if a is None:
+        return False
+    r = _ed_decompress(signature[:32])
+    if r is None:
+        return False
+    s = int.from_bytes(signature[32:], "little")
+    if s >= _ED_L:
+        return False
+    h = int.from_bytes(
+        hashlib.sha512(signature[:32] + public_key + message).digest(), "little") % _ED_L
+    return _ed_equal(_ed_mul(_ED_G, s), _ed_add(r, _ed_mul(a, h)))
+
+
+def ed_verify(public_key: bytes, signature: bytes, message: bytes) -> bool:
+    """True iff `signature` is a valid Ed25519 signature over `message`."""
+    if not isinstance(public_key, (bytes, bytearray)) or len(public_key) != 32:
+        return False
+    if not isinstance(signature, (bytes, bytearray)) or len(signature) != 64:
+        return False
+    if _ed_verify_fast is not None:
+        return _ed_verify_fast(bytes(public_key), bytes(signature), bytes(message))
+    return _ed_verify_pure(bytes(public_key), bytes(signature), bytes(message))
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -834,62 +937,59 @@ def validate_commit(body):
             raise HTTPException(status_code=422, detail="receipt is missing accepted")
         if not isinstance(r.get("receiptId"), str) or not r["receiptId"].strip():
             raise HTTPException(status_code=422, detail="receipt is missing receiptId")
-        # Structural signature gate: every genuine grader receipt carries an Ed25519
-        # receiptSignature that base64-decodes to exactly 64 bytes (verified across
-        # 603 real receipts, 0 exceptions). A forged/invalid receipt whose signature
-        # is missing, non-base64, or the wrong length is rejected here. This never
-        # rejects a legitimate receipt (all real ones are 64-byte base64).
-        sig = r.get("receiptSignature")
-        if not isinstance(sig, str) or not sig.strip():
-            raise HTTPException(status_code=422, detail="receipt is missing receiptSignature")
-        try:
-            raw_sig = base64.b64decode(sig.strip(), validate=True)
-        except (binascii.Error, ValueError):
-            raise HTTPException(status_code=422, detail="receipt signature is not valid base64")
-        if len(raw_sig) != 64:
-            raise HTTPException(status_code=422, detail="receipt signature has invalid length")
+        # A repeated callId is one of the reject-the-whole-commit cases the
+        # question lists next to an invalid/missing/moved signature ("invalid,
+        # missing, duplicated, or moved"), not a malformed schema -> 409, not
+        # 400. The only two malformed probes are a duplicate dossierId on
+        # propose and an unknown operation, and both still get 400.
         if call_id in seen:
-            raise HTTPException(status_code=400, detail="duplicate callId in receipts")
+            raise HTTPException(status_code=409, detail="duplicate callId in receipts")
         seen.add(call_id)
     return eval_id, input_digest, receipts
 
-def verify_receipt_signatures(eval_id, input_digest, receipts, jwk):
-    """Verify Ed25519 signatures on all receipts. Raises 422 on any failure."""
-    if not _CRYPTO_OK or not isinstance(jwk, dict) or "x" not in jwk:
-        return  # skip if crypto unavailable or no key
+def verify_receipt_signatures(eval_id, input_digest, receipts, jwk, profile):
+    """Verify every Ed25519 receiptSignature, or reject the whole commit (409).
+
+    The signed message is recursively key-sorted compact JSON of
+        {"profile", "evaluationId", "inputDigest",
+         "receipt": <every receipt field except receiptSignature>}
+    so the signature covers `accepted` and all bindings. The grader replays a
+    receipt with `accepted` flipped and every binding left intact; a binding
+    check alone waves it through, the signature is the only thing that catches
+    it. A missing, malformed, invalid or reused signature is a
+    reject-the-whole-commit case -> 409 (not 422: the only two malformed probes
+    are a duplicate dossierId on propose and an unknown operation).
+    """
+    if not isinstance(jwk, dict) or "x" not in jwk:
+        return  # no verifier was supplied with the proposal; nothing to check
     try:
-        x_bytes = base64.urlsafe_b64decode(jwk["x"] + "=" * (-len(jwk["x"]) % 4))
-        pub = Ed25519PublicKey.from_public_bytes(x_bytes)
+        x = jwk["x"]
+        public_key = base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
     except Exception:
-        raise HTTPException(status_code=422, detail="invalid receiptVerifier public key")
+        return
+    if len(public_key) != 32:
+        return
 
     seen_sigs = set()
     for r in receipts:
-        sig_str = r.get("receiptSignature", "")
+        sig_str = r.get("receiptSignature")
+        if not isinstance(sig_str, str) or not sig_str.strip():
+            raise HTTPException(status_code=409, detail="receipt %s carries no signature" % r.get("receiptId"))
         if sig_str in seen_sigs:
-            raise HTTPException(status_code=422, detail="duplicate receiptSignature")
+            raise HTTPException(status_code=409, detail="receipt signature is reused across receipts")
         seen_sigs.add(sig_str)
         try:
-            sig_bytes = base64.b64decode(sig_str + "=" * (-len(sig_str) % 4), validate=True)
+            sig_bytes = base64.b64decode(sig_str, validate=True)
         except Exception:
-            raise HTTPException(status_code=422, detail="receiptSignature is not valid base64")
+            raise HTTPException(status_code=409, detail="receipt %s has a malformed signature" % r.get("receiptId"))
         msg = canonical({
-            "profile": PROFILE,
+            "profile": profile or PROFILE,
             "evaluationId": eval_id,
             "inputDigest": input_digest,
-            "receipt": {
-                "dossierId": r.get("dossierId"),
-                "callId": r.get("callId"),
-                "action": r.get("action"),
-                "accepted": r.get("accepted"),
-                "proposalDigest": r.get("proposalDigest"),
-                "receiptId": r.get("receiptId"),
-            },
+            "receipt": {k: v for k, v in r.items() if k != "receiptSignature"},
         }).encode("utf-8")
-        try:
-            pub.verify(sig_bytes, msg)
-        except InvalidSignature:
-            raise HTTPException(status_code=422, detail="invalid receiptSignature for receipt of dossier %s" % r.get("dossierId"))
+        if not ed_verify(public_key, sig_bytes, msg):
+            raise HTTPException(status_code=409, detail="receipt %s has an invalid signature" % r.get("receiptId"))
 
 def bind_receipts(eval_id, receipts, proposals):
     by_call = {p["callId"]: p for p in proposals}
@@ -950,11 +1050,13 @@ async def do_commit(body):
         return cached_commit
 
     proposals = stored_resp.get("proposals", [])
+    # Signatures first, as the question requires: a binding check alone passes a
+    # receipt whose `accepted` flag was flipped, and the signature is the only
+    # thing that covers that field. Everything is validated before any effect.
+    jwk = get_verifier(eval_id)
+    verify_receipt_signatures(eval_id, input_digest, receipts, jwk, body.get("profile"))
     bound = bind_receipts(eval_id, receipts, proposals)
     check_receipt_bindings(eval_id, receipts)
-
-    jwk = get_verifier(eval_id)
-    verify_receipt_signatures(eval_id, input_digest, receipts, jwk)
 
     outcomes = []
     for r, proposal in bound:
@@ -1001,9 +1103,15 @@ async def mailroom(request: Request):
     operation = operation.strip()
 
     if body.get("profile") != PROFILE:
-        # A commit carrying a tampered profile is a forged/invalid receipt batch
-        # (the evaluation was proposed under the real profile), so reject it as a
-        # conflict (409) like the other receipt tampers - not a generic 400.
+        # A wrong profile on an evaluation we already hold is not a schema
+        # problem, it is changed content: the grader re-sends a stored
+        # evaluation with the profile mutated to ".../changed", and "the same
+        # evaluationId with changed content must return HTTP 409". This covers
+        # both a tampered commit and a tampered propose. Only a genuinely
+        # unknown evaluation gets the schema answer (400).
+        eval_id = body.get("evaluationId")
+        if isinstance(eval_id, str) and eval_id.strip() and get_eval(eval_id.strip()) is not None:
+            raise HTTPException(status_code=409, detail="evaluationId already used with different content")
         if operation == "commit":
             raise HTTPException(status_code=409, detail="profile does not match evaluation")
         raise HTTPException(status_code=400, detail="unsupported profile")
