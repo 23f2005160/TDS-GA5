@@ -202,8 +202,23 @@ FALLBACK_CONFIG = {
 
 def load_student_config():
     global CONFIG
-    email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL") or "23f2005160@ds.study.iitm.ac.in"
+    email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL")
     dir_path = os.path.dirname(os.path.abspath(__file__))
+
+    # PRIMARY: pure-Python port of generator.js. Depends on nothing but Python,
+    # so the per-student config is correct on every host. (A missing `node`
+    # binary used to silently fall back to one hard-coded student's config,
+    # which is why a few students scored 3-8/15 on Q3 while most got 15/15.)
+    try:
+        from config_gen import generate_config
+        CONFIG = generate_config(email)
+        app.state.config = CONFIG
+        print(f"Loaded student config via pure-Python generator for {email}!", flush=True)
+        return
+    except Exception as e:
+        print(f"Python config generator failed: {e}", flush=True)
+
+    # SECONDARY: the original Node generator, if Python somehow failed.
     for cmd in ["node", "nodejs"]:
         try:
             res = subprocess.run([cmd, "generator.js", email], capture_output=True, text=True, check=True, cwd=dir_path)
@@ -213,10 +228,10 @@ def load_student_config():
             return
         except Exception as e:
             print(f"Try with '{cmd}' failed: {e}", flush=True)
-            
+
     CONFIG = FALLBACK_CONFIG
     app.state.config = CONFIG
-    print("Using fallback student configuration for 23f2005160@ds.study.iitm.ac.in", flush=True)
+    print("Using fallback student configuration for 23f2xxxxds.study.iitm.ac.in", flush=True)
 
 def setup_q8_files():
     if not CONFIG or "q8" not in CONFIG:
