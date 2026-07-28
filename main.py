@@ -89,10 +89,15 @@ async def log_requests(request: Request, call_next):
         raise e
 
     duration = round((time.time() - start_time) * 1000, 2)
-    # Capture response body for Q11 routes so we can diff what we actually returned
-    resp_body_str = None
+    # Capture the response body for EVERY question route so we can diff exactly
+    # what we returned for each grader probe (needed to diagnose per-question
+    # scoring gaps, e.g. the one Q3 case that fails on Render but passes locally).
+    # Skip /mcp (may stream SSE — consuming its iterator would hang the handshake)
+    # and the /debug endpoints themselves (avoid logging our own log dumps).
     path = request.url.path
-    if "/v2/incidents" in path or "/q11" in path:
+    resp_body_str = None
+    _skip_capture = ("/mcp" in path) or path.startswith("/debug")
+    if not _skip_capture:
         try:
             resp_chunks = []
             async for chunk in response.body_iterator:
